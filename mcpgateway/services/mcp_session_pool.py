@@ -281,6 +281,8 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
             "x-api-key",
             "cookie",
             "x-mcp-session-id",
+            "x-forwarded-user-id",
+            "x-forwarded-user-email",
         ]
     )
 

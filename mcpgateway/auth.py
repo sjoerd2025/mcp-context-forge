@@ -29,7 +29,7 @@ from starlette.requests import Request
 from mcpgateway.common.validators import SecurityValidator
 from mcpgateway.config import settings
 from mcpgateway.db import EmailUser, fresh_db_session, SessionLocal
-from mcpgateway.plugins.framework import get_plugin_manager, GlobalContext, HttpAuthResolveUserPayload, HttpHeaderPayload, HttpHookType, PluginViolationError
+from mcpgateway.plugins.framework import get_plugin_manager, GlobalContext, HttpAuthResolveUserPayload, HttpHeaderPayload, HttpHookType, PluginViolationError, UserContext
 from mcpgateway.utils.correlation_id import get_correlation_id
 from mcpgateway.utils.verify_credentials import verify_jwt_token_cached
 
@@ -1011,8 +1011,7 @@ async def get_current_user(
                 if request and global_context:
                     request.state.plugin_global_context = global_context
 
-                if plugin_manager and plugin_manager.config.plugin_settings.include_user_info:
-                    _inject_userinfo_instate(request, user)
+                _inject_userinfo_instate(request, user)
 
                 return user
             # If continue_processing=True (no payload), fall through to standard auth
@@ -1137,8 +1136,7 @@ async def get_current_user(
                                     headers={"WWW-Authenticate": "Bearer"},
                                 )
 
-                        if plugin_manager and plugin_manager.config.plugin_settings.include_user_info:
-                            _inject_userinfo_instate(request, _user_from_cached_dict(cached_ctx.user))
+                        _inject_userinfo_instate(request, _user_from_cached_dict(cached_ctx.user))
 
                         return _user_from_cached_dict(cached_ctx.user)
 
@@ -1267,8 +1265,7 @@ async def get_current_user(
                             headers={"WWW-Authenticate": "Bearer"},
                         )
 
-                if plugin_manager and plugin_manager.config.plugin_settings.include_user_info:
-                    _inject_userinfo_instate(request, _batched_user)
+                _inject_userinfo_instate(request, _batched_user)
 
                 return _batched_user
 
@@ -1442,15 +1439,17 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if plugin_manager and plugin_manager.config.plugin_settings.include_user_info:
-        _inject_userinfo_instate(request, user)
+    _inject_userinfo_instate(request, user)
 
     return user
 
 
 def _inject_userinfo_instate(request: Optional[object] = None, user: Optional[EmailUser] = None) -> None:
-    """This function injects user related information into the plugin_global_context, if the config has
-    include_user_info key set as true.
+    """Inject user identity into the plugin_global_context.
+
+    Always populates both the legacy ``global_context.user`` dict (for backward
+    compatibility) and the new structured ``global_context.user_context``
+    (:class:`UserContext`).
 
     Args:
         request: Optional request object for plugin hooks
@@ -1479,11 +1478,28 @@ def _inject_userinfo_instate(request: Optional[object] = None, user: Optional[Em
         )
 
     if user:
+        # Backward-compatible dict population
         if not global_context.user:
             global_context.user = {}
         global_context.user["email"] = user.email
         global_context.user["is_admin"] = user.is_admin
         global_context.user["full_name"] = user.full_name
+
+        # Build structured UserContext
+        auth_method = getattr(request.state, "auth_method", None) if request and hasattr(request, "state") else None
+        token_teams = getattr(request.state, "token_teams", None) if request and hasattr(request, "state") else None
+        team_id = getattr(request.state, "team_id", None) if request and hasattr(request, "state") else None
+
+        global_context.user_context = UserContext(
+            user_id=user.email,
+            email=user.email,
+            full_name=user.full_name,
+            is_admin=user.is_admin,
+            teams=token_teams if isinstance(token_teams, list) else None,
+            team_id=team_id,
+            auth_method=auth_method,
+            authenticated_at=datetime.now(timezone.utc),
+        )
 
     if request and global_context:
         request.state.plugin_global_context = global_context
