@@ -130,20 +130,25 @@ async function generateSchemasFromOpenAPI() {
         }
 
         // Call backend endpoint to generate schemas
-        const response = await fetchWithTimeout(`/admin/tools/generate-schemas-from-openapi`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
+        const response = await fetchWithTimeout(
+            `/admin/tools/generate-schemas-from-openapi`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    url: newUrl,
+                    request_type: requestType,
+                }),
+                timeout: 15000,
             },
-            body: JSON.stringify({
-                url: newUrl,
-                request_type: requestType,
-            }),
-            timeout: 15000,
-        });
+        );
 
         if (!response.ok) {
-            const errorData = await response.json().catch(() => ({ message: response.statusText }));
+            const errorData = await response
+                .json()
+                .catch(() => ({ message: response.statusText }));
             throw new Error(errorData.message || `HTTP ${response.status}`);
         }
 
@@ -153,10 +158,12 @@ async function generateSchemasFromOpenAPI() {
             throw new Error(data.message || "Failed to generate schemas");
         }
 
-        const { input_schema, output_schema } = data;
+        const { input_schema: inputSchema, output_schema: outputSchema } = data;
 
         // Switch to JSON Input mode
-        const jsonRadio = document.querySelector('input[name="schema_input_mode"][value="json"]');
+        const jsonRadio = document.querySelector(
+            'input[name="schema_input_mode"][value="json"]',
+        );
         if (jsonRadio) {
             jsonRadio.checked = true;
             const event = new Event("change", { bubbles: true });
@@ -166,10 +173,12 @@ async function generateSchemasFromOpenAPI() {
         // Populate input schema only if it exists
         const schemaField = safeGetElement("schema-editor");
         if (schemaField) {
-            if (input_schema) {
-                schemaField.value = JSON.stringify(input_schema, null, 2);
+            if (inputSchema) {
+                schemaField.value = JSON.stringify(inputSchema, null, 2);
                 if (window.schemaEditor) {
-                    window.schemaEditor.setValue(JSON.stringify(input_schema, null, 2));
+                    window.schemaEditor.setValue(
+                        JSON.stringify(inputSchema, null, 2),
+                    );
                     window.schemaEditor.refresh();
                 }
             } else {
@@ -184,10 +193,12 @@ async function generateSchemasFromOpenAPI() {
         // Populate output schema only if it exists
         const outputSchemaField = safeGetElement("output-schema-editor");
         if (outputSchemaField) {
-            if (output_schema) {
-                outputSchemaField.value = JSON.stringify(output_schema, null, 2);
+            if (outputSchema) {
+                outputSchemaField.value = JSON.stringify(outputSchema, null, 2);
                 if (window.outputSchemaEditor) {
-                    window.outputSchemaEditor.setValue(JSON.stringify(output_schema, null, 2));
+                    window.outputSchemaEditor.setValue(
+                        JSON.stringify(outputSchema, null, 2),
+                    );
                     window.outputSchemaEditor.refresh();
                 }
             } else {
@@ -201,7 +212,9 @@ async function generateSchemasFromOpenAPI() {
         }
 
         console.log("✓ Schemas populated from OpenAPI spec");
-        alert("Schemas generated successfully from OpenAPI spec!\n\nPlease review the generated schemas before saving.");
+        alert(
+            "Schemas generated successfully from OpenAPI spec!\n\nPlease review the generated schemas before saving.",
+        );
     } catch (error) {
         console.error("Error generating schemas from OpenAPI:", error);
         alert(`Error: ${error.message}`);
@@ -245,20 +258,25 @@ async function generateSchemasFromOpenAPIEdit() {
         }
 
         // Call backend endpoint to generate schemas
-        const response = await fetchWithTimeout(`/admin/tools/generate-schemas-from-openapi`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
+        const response = await fetchWithTimeout(
+            `/admin/tools/generate-schemas-from-openapi`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    url: newUrl,
+                    request_type: requestType,
+                }),
+                timeout: 15000,
             },
-            body: JSON.stringify({
-                url: newUrl,
-                request_type: requestType,
-            }),
-            timeout: 15000,
-        });
+        );
 
         if (!response.ok) {
-            const errorData = await response.json().catch(() => ({ message: response.statusText }));
+            const errorData = await response
+                .json()
+                .catch(() => ({ message: response.statusText }));
             throw new Error(errorData.message || `HTTP ${response.status}`);
         }
 
@@ -268,15 +286,17 @@ async function generateSchemasFromOpenAPIEdit() {
             throw new Error(data.message || "Failed to generate schemas");
         }
 
-        const { input_schema, output_schema } = data;
+        const { input_schema: inputSchema, output_schema: outputSchema } = data;
 
         // Populate input schema only if it exists
         const schemaField = safeGetElement("edit-tool-schema");
         if (schemaField) {
-            if (input_schema) {
-                schemaField.value = JSON.stringify(input_schema, null, 2);
+            if (inputSchema) {
+                schemaField.value = JSON.stringify(inputSchema, null, 2);
                 if (window.editToolSchemaEditor) {
-                    window.editToolSchemaEditor.setValue(JSON.stringify(input_schema, null, 2));
+                    window.editToolSchemaEditor.setValue(
+                        JSON.stringify(inputSchema, null, 2),
+                    );
                     window.editToolSchemaEditor.refresh();
                 }
             } else {
@@ -291,10 +311,12 @@ async function generateSchemasFromOpenAPIEdit() {
         // Populate output schema only if it exists
         const outputSchemaField = safeGetElement("edit-tool-output-schema");
         if (outputSchemaField) {
-            if (output_schema) {
-                outputSchemaField.value = JSON.stringify(output_schema, null, 2);
+            if (outputSchema) {
+                outputSchemaField.value = JSON.stringify(outputSchema, null, 2);
                 if (window.editToolOutputSchemaEditor) {
-                    window.editToolOutputSchemaEditor.setValue(JSON.stringify(output_schema, null, 2));
+                    window.editToolOutputSchemaEditor.setValue(
+                        JSON.stringify(outputSchema, null, 2),
+                    );
                     window.editToolOutputSchemaEditor.refresh();
                 }
             } else {
@@ -308,7 +330,9 @@ async function generateSchemasFromOpenAPIEdit() {
         }
 
         console.log("✓ Schemas updated from OpenAPI spec");
-        alert("Schemas generated successfully from OpenAPI spec!\n\nPlease review the generated schemas before saving.");
+        alert(
+            "Schemas generated successfully from OpenAPI spec!\n\nPlease review the generated schemas before saving.",
+        );
     } catch (error) {
         console.error("Error generating schemas from OpenAPI:", error);
         alert(`Error: ${error.message}`);
@@ -1280,10 +1304,10 @@ function validateUrl(url, label = "") {
  * SECURITY: Validate JSON input
  */
 function validateJson(jsonString, fieldName = "JSON") {
-    if (!jsonString || (typeof jsonString === 'string' && !jsonString.trim())) {
+    if (!jsonString || (typeof jsonString === "string" && !jsonString.trim())) {
         return { valid: true, value: {} }; // Empty is OK, defaults to empty object
     }
-    
+
     // Handle explicit null
     if (jsonString === null) {
         return { valid: true, value: null };
@@ -15946,7 +15970,9 @@ async function viewTool(toolId) {
             );
             setTextSafely(
                 ".tool-output-schema",
-                tool.outputSchema ? JSON.stringify(tool.outputSchema, null, 2) : "",
+                tool.outputSchema
+                    ? JSON.stringify(tool.outputSchema, null, 2)
+                    : "",
             );
 
             // Set auth fields safely
