@@ -2194,7 +2194,7 @@ class TestAdminAuthMiddleware:
         """User with only team-scoped admin.dashboard should pass when request has valid team_id."""
         middleware = AdminAuthMiddleware(None)
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
             query_params={"team_id": "a1b2c3d4e5f6789012345678abcdef01"},
         )
@@ -2234,7 +2234,7 @@ class TestAdminAuthMiddleware:
         """team_id not in user's teams should be ignored (falls back to global check)."""
         middleware = AdminAuthMiddleware(None)
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
             query_params={"team_id": "00000000000000000000000000000099"},
         )
@@ -2275,7 +2275,7 @@ class TestAdminAuthMiddleware:
         """Request without team_id should check global permissions only (original behavior)."""
         middleware = AdminAuthMiddleware(None)
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
         )
         call_next = AsyncMock(return_value="ok")
@@ -2314,7 +2314,7 @@ class TestAdminAuthMiddleware:
         """Empty string team_id in query params should be treated as absent."""
         middleware = AdminAuthMiddleware(None)
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
             query_params={"team_id": ""},
         )
@@ -2354,7 +2354,7 @@ class TestAdminAuthMiddleware:
         """Admin bypass (token_teams=None) should ignore team_id in query and pass None."""
         middleware = AdminAuthMiddleware(None)
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
             query_params={"team_id": "a1b2c3d4e5f6789012345678abcdef01"},
         )
@@ -2396,7 +2396,7 @@ class TestAdminAuthMiddleware:
         middleware = AdminAuthMiddleware(None)
         # Hyphenated form of the same UUID
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
             query_params={"team_id": "a1b2c3d4-e5f6-7890-1234-5678abcdef01"},
         )
@@ -2437,7 +2437,7 @@ class TestAdminAuthMiddleware:
         """Non-UUID team_id in query params should be treated as absent (not a valid UUID)."""
         middleware = AdminAuthMiddleware(None)
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
             query_params={"team_id": "not-a-valid-uuid"},
         )
@@ -2480,7 +2480,7 @@ class TestAdminAuthMiddleware:
 
         middleware = AdminAuthMiddleware(None)
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
         )
         # Simulate repeated keys — .get() returns the last value
@@ -2521,7 +2521,7 @@ class TestAdminAuthMiddleware:
         """Non-UUID team_id should still match when token_teams contains the same non-UUID string (legacy/CLI tokens)."""
         middleware = AdminAuthMiddleware(None)
         request = _make_request(
-            "/admin/tools",
+            "/ui/tools",
             headers={"Authorization": "Bearer token"},
             query_params={"team_id": "team-slug-123"},
         )
