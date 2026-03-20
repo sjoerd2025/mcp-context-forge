@@ -4559,6 +4559,7 @@ class ToolService(BaseService):
                             start_time=start_time,
                             success=success,
                             error_message=error_message,
+                            server_id=server_id,
                         )
                     except Exception as metric_error:
                         logger.warning(f"Failed to record tool metric: {metric_error}")
