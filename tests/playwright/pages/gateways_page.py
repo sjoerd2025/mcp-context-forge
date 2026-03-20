@@ -570,12 +570,33 @@ class GatewaysPage(BasePage):
 
     # ==================== Gateway Row Actions ====================
 
+    def open_overflow_menu(self, gateway_row_or_index: int | Locator = 0) -> None:
+        """Open the overflow menu (three-dot menu) for a gateway row.
+
+        Args:
+            gateway_row_or_index: Either an integer index or a Locator for the gateway row (default: 0 for first gateway)
+        """
+        if isinstance(gateway_row_or_index, int):
+            gateway_row = self.gateway_rows.nth(gateway_row_or_index)
+        else:
+            gateway_row = gateway_row_or_index
+        
+        # Find the three-dot menu button (has SVG with three circles)
+        menu_button = gateway_row.locator('button[aria-expanded]')
+        self.click_locator(menu_button)
+        # Wait for dropdown menu to be visible
+        dropdown = gateway_row.locator('div[x-show="menuOpen"]')
+        self.wait_for_visible(dropdown)
+        # Wait for Alpine.js transition animation
+        self.page.wait_for_timeout(150)
+
     def click_test_button(self, gateway_index: int = 0) -> None:
         """Click the Test button for a gateway.
 
         Args:
             gateway_index: Index of the gateway row (default: 0 for first gateway)
         """
+        self.open_overflow_menu(gateway_index)
         gateway_row = self.gateway_rows.nth(gateway_index)
         test_btn = gateway_row.locator('button:has-text("Test")')
         self.click_locator(test_btn)
@@ -586,6 +607,7 @@ class GatewaysPage(BasePage):
         Args:
             gateway_index: Index of the gateway row (default: 0 for first gateway)
         """
+        self.open_overflow_menu(gateway_index)
         gateway_row = self.gateway_rows.nth(gateway_index)
         view_btn = gateway_row.locator('button:has-text("View")')
         self.click_locator(view_btn)
@@ -596,6 +618,7 @@ class GatewaysPage(BasePage):
         Args:
             gateway_index: Index of the gateway row (default: 0 for first gateway)
         """
+        self.open_overflow_menu(gateway_index)
         gateway_row = self.gateway_rows.nth(gateway_index)
         edit_btn = gateway_row.locator('button:has-text("Edit")')
         self.click_locator(edit_btn)
@@ -606,6 +629,7 @@ class GatewaysPage(BasePage):
         Args:
             gateway_index: Index of the gateway row (default: 0 for first gateway)
         """
+        self.open_overflow_menu(gateway_index)
         gateway_row = self.gateway_rows.nth(gateway_index)
         deactivate_btn = gateway_row.locator('button:has-text("Deactivate")')
         self.click_locator(deactivate_btn)
@@ -616,6 +640,7 @@ class GatewaysPage(BasePage):
         Args:
             gateway_index: Index of the gateway row (default: 0 for first gateway)
         """
+        self.open_overflow_menu(gateway_index)
         gateway_row = self.gateway_rows.nth(gateway_index)
         activate_btn = gateway_row.locator('button:text-is("Activate")')
         self.click_locator(activate_btn)
@@ -664,7 +689,10 @@ class GatewaysPage(BasePage):
         # Scroll the row into view first
         gateway_row.scroll_into_view_if_needed()
 
-        # Find the delete button within the row's action column
+        # Open overflow menu
+        self.open_overflow_menu(gateway_row)
+
+        # Find the delete button within the dropdown
         delete_btn = gateway_row.locator('form[action*="/delete"] button[type="submit"]:has-text("Delete")')
         self._click_delete_and_wait(delete_btn, confirm)
 
@@ -692,6 +720,8 @@ class GatewaysPage(BasePage):
                 gateway_row = self.get_gateway_row_by_name(gateway_name)
                 gateway_row.first.wait_for(state="attached", timeout=5000)
                 gateway_row.first.scroll_into_view_if_needed()
+                 # Open overflow menu
+                self.open_overflow_menu(gateway_row.first)
                 delete_btn = gateway_row.first.locator('form[action*="/delete"] button[type="submit"]:has-text("Delete")')
                 self._click_delete_and_wait(delete_btn, confirm)
                 return True
@@ -700,6 +730,9 @@ class GatewaysPage(BasePage):
                     self.page.wait_for_timeout(500)
                     continue
                 raise
+
+        # Open overflow menu
+        self.open_overflow_menu(gateway_row.first)
 
         return False
 
@@ -740,6 +773,9 @@ class GatewaysPage(BasePage):
 
             # Get the delete button and use shared delete+navigation helper
             try:
+                # Open overflow menu
+                self.open_overflow_menu(gateway_row.first)
+                
                 delete_btn = gateway_row.first.locator('form[action*="/delete"] button[type="submit"]:has-text("Delete")')
                 self._click_delete_and_wait(delete_btn, confirm)
 

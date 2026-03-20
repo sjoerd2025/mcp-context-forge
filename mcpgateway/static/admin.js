@@ -20845,11 +20845,22 @@ async function refreshGatewayTools(gatewayId, gatewayName, buttonEl) {
     }
 
     try {
-        const response = await fetch(`${window.ROOT_PATH}/gateways/${gatewayId}/tools/refresh`, {
-            method: "POST",
-            credentials: "include",
-            headers: { Accept: "application/json" },
-        });
+        const csrfToken =
+            document.cookie
+                .split("; ")
+                .find((row) => row.startsWith("mcpgateway_csrf_token="))
+                ?.split("=")[1] ?? "";
+        const response = await fetch(
+            `${window.ROOT_PATH}/gateways/${gatewayId}/tools/refresh`,
+            {
+                method: "POST",
+                credentials: "include",
+                headers: {
+                    Accept: "application/json",
+                    "x-csrf-token": csrfToken,
+                },
+            },
+        );
 
         const data = await response.json();
         if (!response.ok) {
@@ -20861,9 +20872,14 @@ async function refreshGatewayTools(gatewayId, gatewayName, buttonEl) {
             throw new Error(data.error || "Refresh failed on the server");
         }
 
-        showSuccessMessage(
-            `${gatewayName}: ${data.toolsAdded ?? 0} added, ${data.toolsUpdated ?? 0} updated, ${data.toolsRemoved ?? 0} removed`,
-        );
+        const toolsAdded = data.toolsAdded ?? 0;
+        const toolsUpdated = data.toolsUpdated ?? 0;
+        const toolsRemoved = data.toolsRemoved ?? 0;
+        const deltaMsg =
+            toolsAdded || toolsUpdated || toolsRemoved
+                ? `${toolsAdded} added, ${toolsUpdated} updated, ${toolsRemoved} removed`
+                : "No changes detected";
+        showSuccessMessage(`${gatewayName}: ${deltaMsg}`);
 
         // Reload the gateways partial table via HTMX to reflect updated tool counts / button labels
         htmx.ajax("GET", `${window.ROOT_PATH}/admin/gateways/partial`, {
@@ -20872,7 +20888,9 @@ async function refreshGatewayTools(gatewayId, gatewayName, buttonEl) {
         });
     } catch (err) {
         console.error("refreshGatewayTools error:", err);
-        showErrorMessage(`Failed to refresh tools for ${gatewayName}: ${err.message}`);
+        showErrorMessage(
+            `Failed to refresh tools for ${gatewayName}: ${err.message}`,
+        );
         if (buttonEl) {
             buttonEl.disabled = false;
             buttonEl.textContent = origText;
@@ -20889,8 +20907,15 @@ window.refreshGatewayTools = refreshGatewayTools;
  * @param {HTMLElement} buttonEl - The button element clicked
  */
 async function refreshToolsForSelectedGateways(buttonEl) {
+    if (typeof getSelectedGatewayIds !== "function") {
+        console.warn(
+            "refreshToolsForSelectedGateways: getSelectedGatewayIds is not defined",
+        );
+    }
     const gwIds =
-        typeof getSelectedGatewayIds === "function" ? getSelectedGatewayIds() : [];
+        typeof getSelectedGatewayIds === "function"
+            ? getSelectedGatewayIds()
+            : [];
     if (!gwIds.length) {
         showErrorMessage("Select at least one MCP gateway first.");
         return;
@@ -20900,19 +20925,30 @@ async function refreshToolsForSelectedGateways(buttonEl) {
     buttonEl.disabled = true;
     buttonEl.textContent = "⏳ Refreshing...";
 
-    let added = 0,
-        updated = 0,
-        removed = 0,
-        failed = 0;
+    let added = 0;
+    let updated = 0;
+    let removed = 0;
+    let failed = 0;
 
     await Promise.allSettled(
         gwIds.map(async (gid) => {
             try {
-                const res = await fetch(`${window.ROOT_PATH}/gateways/${gid}/tools/refresh`, {
-                    method: "POST",
-                    credentials: "include",
-                    headers: { Accept: "application/json" },
-                });
+                const csrfToken =
+                    document.cookie
+                        .split("; ")
+                        .find((row) => row.startsWith("mcpgateway_csrf_token="))
+                        ?.split("=")[1] ?? "";
+                const res = await fetch(
+                    `${window.ROOT_PATH}/gateways/${gid}/tools/refresh`,
+                    {
+                        method: "POST",
+                        credentials: "include",
+                        headers: {
+                            Accept: "application/json",
+                            "x-csrf-token": csrfToken,
+                        },
+                    },
+                );
                 const data = await res.json();
                 if (res.ok && data.success !== false) {
                     added += data.toolsAdded ?? 0;
@@ -20930,11 +20966,16 @@ async function refreshToolsForSelectedGateways(buttonEl) {
     buttonEl.disabled = false;
     buttonEl.textContent = origText;
 
-    const msg = `${added} added, ${updated} updated, ${removed} removed`;
+    const deltaMsg =
+        added || updated || removed
+            ? `${added} added, ${updated} updated, ${removed} removed`
+            : "No changes detected";
     if (failed > 0) {
-        showErrorMessage(`Refresh completed with ${failed} error(s). ${msg}`);
+        showErrorMessage(
+            `Refresh completed with ${failed} error(s). ${deltaMsg}`,
+        );
     } else {
-        showSuccessMessage(`Tools refreshed: ${msg}`);
+        showSuccessMessage(`Tools refreshed: ${deltaMsg}`);
     }
 
     // Reload the tools selector via HTMX to pick up newly discovered tools

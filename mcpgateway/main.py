@@ -72,7 +72,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 # Import the admin routes from the new module
 from mcpgateway import __version__
 from mcpgateway import version as version_module
-from mcpgateway.admin import admin_router, set_logging_service
+from mcpgateway.admin import admin_router, enforce_admin_csrf, set_logging_service
 from mcpgateway.auth import _check_token_revoked_sync, _lookup_api_token_sync, get_current_user, get_user_team_roles, normalize_token_teams, resolve_session_teams
 from mcpgateway.bootstrap_db import main as bootstrap_db
 from mcpgateway.cache import ResourceCache, SessionRegistry
@@ -6577,7 +6577,7 @@ async def delete_gateway(gateway_id: str, db: Session = Depends(get_db), user=De
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@gateway_router.post("/{gateway_id}/tools/refresh", response_model=GatewayRefreshResponse)
+@gateway_router.post("/{gateway_id}/tools/refresh", response_model=GatewayRefreshResponse, dependencies=[Depends(enforce_admin_csrf)])
 @require_permission("gateways.update")
 async def refresh_gateway_tools(
     gateway_id: str,

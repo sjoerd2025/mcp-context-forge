@@ -29,6 +29,24 @@
 
 > **Migration**: Switch to PostgreSQL for production deployments. Update `DATABASE_URL` to a `postgresql+psycopg://` connection string. SQLite (`sqlite:///./mcp.db`) remains available for local development and testing.
 
+### Added
+
+#### **Refresh Tools Button for All Gateway Types** ([#3765](https://github.com/IBM/mcp-context-forge/issues/3765))
+
+Users can now pull the latest tools from any registered MCP without re-registering the gateway.
+
+* A **Fetch Tools** / **Refresh Tools** action is available for all gateway auth types (previously limited to OAuth only) via the new overflow menu in the gateways table
+* The label reads **Fetch Tools** on first use (no tools registered yet) and automatically switches to **Refresh Tools** once tools exist, driven by the new `toolCount` field on `GatewayRead`
+* On success, a toast notification shows the delta: tools added / updated / removed
+* The table reloads via HTMX to reflect updated tool counts and button labels without a full page refresh
+* A **Refresh from MCPs** button is also available in the virtual server edit form, allowing users to pull the latest tools from all currently selected gateways and reload the tools selector without leaving the modal
+* Backed by the existing `POST /gateways/{id}/tools/refresh` API endpoint
+
+#### **Overflow Menu for Gateways Table** ([#3519](https://github.com/IBM/mcp-context-forge/issues/3519))
+
+* Replaced the stacked action buttons in the gateways table with a single overflow menu (three-dot button), reducing visual clutter and aligning with the Carbon Design System overflow menu pattern
+* All existing actions (Test, OAuth Authorize, Fetch/Refresh Tools, View, Edit, Activate/Deactivate, Delete) remain fully accessible inside the menu
+
 ## [1.0.0-RC2] - 2026-03-09 - Hardening, Admin UI Polish, Plugin Framework & Quality
 
 ### Overview

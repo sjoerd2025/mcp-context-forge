@@ -63,7 +63,7 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 from pydantic import ValidationError
-from sqlalchemy import and_, delete, desc, or_, select, update
+from sqlalchemy import and_, delete, desc, inspect as sa_inspect, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload, selectinload, Session
 
@@ -4176,9 +4176,9 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         gateway_dict["version"] = getattr(gateway, "version", None)
         gateway_dict["team"] = getattr(gateway, "team", None)
 
-        # Populate tool count from the eagerly-loaded tools relationship when available
-        tools_rel = gateway.__dict__.get("tools")
-        gateway_dict["tool_count"] = len(tools_rel) if tools_rel is not None else 0
+        # Use official SQLAlchemy inspect API; returns 0 if tools relationship is not loaded
+        tools_loaded = sa_inspect(gateway).attrs["tools"].loaded_value
+        gateway_dict["tool_count"] = len(tools_loaded) if isinstance(tools_loaded, list) else 0
 
         return GatewayRead.model_validate(gateway_dict).masked()
 

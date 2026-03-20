@@ -1379,19 +1379,6 @@ def _resolve_root_path(request: Request) -> str:
     return root_path.rstrip("/")
 
 
-def _admin_cookie_path(request: Request) -> str:
-    """Build admin cookie path honoring ASGI root_path.
-
-    Args:
-        request: Incoming request used to read ASGI ``root_path``.
-
-    Returns:
-        Admin cookie path scoped under the deployed app root.
-    """
-    root_path = _resolve_root_path(request)
-    return f"{root_path}/admin" if root_path else "/admin"
-
-
 def _normalize_origin_parts(scheme: str, netloc: str) -> tuple[str, str, int]:
     """Normalize origin components for exact same-origin comparisons.
 
@@ -1495,11 +1482,12 @@ def _set_admin_csrf_cookie(request: Request, response: Response) -> str:
 
     use_secure = (settings.environment == "production") or settings.secure_cookies
     max_age = max(300, int(getattr(settings, "token_expiry", 60)) * 60)
+    cookie_path = _resolve_root_path(request) or "/"
     response.set_cookie(
         key=ADMIN_CSRF_COOKIE_NAME,
         value=csrf_token,
         max_age=max_age,
-        path=_admin_cookie_path(request),
+        path=cookie_path,
         httponly=False,
         secure=use_secure,
         samesite="strict",
@@ -1517,7 +1505,7 @@ def _clear_admin_csrf_cookie(request: Request, response: Response) -> None:
     use_secure = (settings.environment == "production") or settings.secure_cookies
     response.delete_cookie(
         key=ADMIN_CSRF_COOKIE_NAME,
-        path=_admin_cookie_path(request),
+        path=_resolve_root_path(request) or "/",
         secure=use_secure,
         httponly=False,
         samesite="strict",
@@ -7724,9 +7712,7 @@ async def admin_create_user(
         )
 
         # If the user was created with the default password, optionally force password change
-        if (
-            settings.password_change_enforcement_enabled and getattr(settings, "require_password_change_for_default_password", True) and password == settings.default_user_password.get_secret_value()
-        ):  # nosec B105
+        if settings.password_change_enforcement_enabled and getattr(settings, "require_password_change_for_default_password", True) and password == settings.default_user_password.get_secret_value():  # nosec B105
             new_user.password_change_required = True
             db.commit()
 
@@ -7856,12 +7842,16 @@ async def admin_get_user_edit(
                     <input type="text" name="full_name" value="{user_obj.full_name or ""}" required
                            class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
                 </div>
-                {"" if is_editing_self else f'''<div>
+                {
+            ""
+            if is_editing_self
+            else f'''<div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
                         <input type="checkbox" name="is_admin" {"checked" if user_obj.is_admin else ""}
                                class="mr-2"> Administrator
                     </label>
-                </div>'''}
+                </div>'''
+        }
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
                         <input type="checkbox" name="email_verified" {"checked" if user_obj.is_email_verified() else ""}
