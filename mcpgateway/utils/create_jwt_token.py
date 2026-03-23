@@ -26,15 +26,15 @@ Doctest examples
 >>> from mcpgateway.utils import create_jwt_token as jwt_util
 >>> from mcpgateway.utils.jwt_config_helper import clear_jwt_caches
 >>> clear_jwt_caches()
->>> jwt_util.settings.jwt_secret_key = 'secret'
+>>> jwt_util.settings.jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
 >>> jwt_util.settings.jwt_algorithm = 'HS256'
->>> token = jwt_util._create_jwt_token({'sub': 'alice'}, expires_in_minutes=1, secret='secret', algorithm='HS256')
+>>> token = jwt_util._create_jwt_token({'sub': 'alice'}, expires_in_minutes=1, secret='this-is-a-long-test-secret-key-32chars', algorithm='HS256')
 >>> import jwt
->>> jwt.decode(token, 'secret', algorithms=['HS256'], audience=jwt_util.settings.jwt_audience, issuer=jwt_util.settings.jwt_issuer)['sub'] == 'alice'
+>>> jwt.decode(token, 'this-is-a-long-test-secret-key-32chars', algorithms=['HS256'], audience=jwt_util.settings.jwt_audience, issuer=jwt_util.settings.jwt_issuer)['sub'] == 'alice'
 True
 >>> import asyncio
->>> t = asyncio.run(jwt_util.create_jwt_token({'sub': 'bob'}, expires_in_minutes=1, secret='secret', algorithm='HS256'))
->>> jwt.decode(t, 'secret', algorithms=['HS256'], audience=jwt_util.settings.jwt_audience, issuer=jwt_util.settings.jwt_issuer)['sub'] == 'bob'
+>>> t = asyncio.run(jwt_util.create_jwt_token({'sub': 'bob'}, expires_in_minutes=1, secret='this-is-a-long-test-secret-key-32chars', algorithm='HS256'))
+>>> jwt.decode(t, 'this-is-a-long-test-secret-key-32chars', algorithms=['HS256'], audience=jwt_util.settings.jwt_audience, issuer=jwt_util.settings.jwt_issuer)['sub'] == 'bob'
 True
 """
 
@@ -69,6 +69,7 @@ __all__: Sequence[str] = (
 DEFAULT_ALGO: str = settings.jwt_algorithm
 DEFAULT_EXP_MINUTES: int = settings.token_expiry
 DEFAULT_USERNAME: str = settings.basic_auth_user
+_TEAMS_UNSET = object()
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +83,7 @@ def _create_jwt_token(
     secret: str = "",  # nosec B107 - Optional override; uses config if empty
     algorithm: str = "",  # Optional override; uses config if empty
     user_data: Optional[Dict[str, Any]] = None,
-    teams: Optional[List[str]] = None,
-    namespaces: Optional[List[str]] = None,
+    teams: Optional[List[str]] | object = _TEAMS_UNSET,
     scopes: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Create a signed JWT token with automatic key selection and validation.
@@ -94,7 +94,7 @@ def _create_jwt_token(
     a properly formatted JWT token with standard claims.
 
     Supports both simple tokens (minimal claims) and rich tokens (with user, teams,
-    namespaces, and scopes). This enables consistent token format across CLI and API
+    and scopes). This enables consistent token format across CLI and API
     token creation paths.
 
     Args:
@@ -104,7 +104,8 @@ def _create_jwt_token(
         algorithm: Optional signing algorithm. If empty, uses JWT_ALGORITHM from config.
         user_data: Optional user information dict with keys: email, full_name, is_admin, auth_provider.
         teams: Optional list of team IDs the token is scoped to.
-        namespaces: Optional list of namespaces for access control. Auto-generated from teams if not provided.
+            Pass ``None`` explicitly to serialize ``"teams": null``.
+            Omit the argument to leave the claim unchanged/absent.
         scopes: Optional scopes dict with keys: server_id, permissions, ip_restrictions, time_restrictions.
 
     Returns:
@@ -150,16 +151,8 @@ def _create_jwt_token(
     if user_data:
         payload["user"] = user_data
 
-    if teams is not None:
+    if teams is not _TEAMS_UNSET:
         payload["teams"] = teams
-
-    # Auto-generate namespaces from teams if not explicitly provided
-    if namespaces is not None:
-        payload["namespaces"] = namespaces
-    elif teams is not None:
-        # Build namespaces: user namespace + public + team namespaces
-        user_email = data.get("sub") or data.get("username", "")
-        payload["namespaces"] = [f"user:{user_email}", "public"] + [f"team:{t}" for t in teams]
 
     if scopes is not None:
         payload["scopes"] = scopes
@@ -194,8 +187,7 @@ async def create_jwt_token(
     secret: str = None,
     algorithm: str = None,
     user_data: Optional[Dict[str, Any]] = None,
-    teams: Optional[List[str]] = None,
-    namespaces: Optional[List[str]] = None,
+    teams: Optional[List[str]] | object = _TEAMS_UNSET,
     scopes: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
@@ -209,7 +201,8 @@ async def create_jwt_token(
         algorithm: Optional signing algorithm. If None/empty, uses JWT_ALGORITHM from config.
         user_data: Optional user information dict with keys: email, full_name, is_admin, auth_provider.
         teams: Optional list of team IDs the token is scoped to.
-        namespaces: Optional list of namespaces for access control.
+            Pass ``None`` explicitly to serialize ``"teams": null``.
+            Omit to leave teams absent.
         scopes: Optional scopes dict with keys: server_id, permissions, ip_restrictions, time_restrictions.
 
     Returns:
@@ -219,7 +212,7 @@ async def create_jwt_token(
     >>> from mcpgateway.utils import create_jwt_token as jwt_util
     >>> from mcpgateway.utils.jwt_config_helper import clear_jwt_caches
     >>> clear_jwt_caches()
-    >>> jwt_util.settings.jwt_secret_key = 'secret'
+    >>> jwt_util.settings.jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
     >>> jwt_util.settings.jwt_algorithm = 'HS256'
     >>> import asyncio
     >>> t = asyncio.run(jwt_util.create_jwt_token({'sub': 'bob'}, expires_in_minutes=1))
@@ -228,7 +221,7 @@ async def create_jwt_token(
     True
     """
     # Pass through secret/algorithm; _create_jwt_token will use config as fallback
-    return _create_jwt_token(data, expires_in_minutes, secret or "", algorithm or "", user_data, teams, namespaces, scopes)
+    return _create_jwt_token(data, expires_in_minutes, secret or "", algorithm or "", user_data, teams, scopes)
 
 
 async def get_jwt_token() -> str:
@@ -488,8 +481,7 @@ def main() -> None:  # pragma: no cover
 
     # Build rich token parameters if provided
     user_data = None
-    teams = None
-    namespaces = None
+    teams: object = _TEAMS_UNSET
     scopes_dict = None
 
     if args.admin or args.teams or args.scopes or args.full_name:
@@ -503,7 +495,9 @@ def main() -> None:  # pragma: no cover
             "auth_provider": "cli",  # Mark as CLI-generated for auditing
         }
 
-        # Build teams list
+        # Build teams claim. In rich-token mode, explicit null preserves
+        # normalize_token_teams semantics for admin bypass when intended.
+        teams = None
         if args.teams:
             teams = [t.strip() for t in args.teams.split(",") if t.strip()]
 
@@ -528,7 +522,15 @@ def main() -> None:  # pragma: no cover
             print(orjson.dumps(scopes_dict, default=str, option=orjson.OPT_INDENT_2).decode())
         print("-")
 
-    token = _create_jwt_token(payload, args.exp, args.secret, args.algo, user_data, teams, namespaces, scopes_dict)
+    token = _create_jwt_token(
+        payload,
+        args.exp,
+        args.secret,
+        args.algo,
+        user_data=user_data,
+        teams=teams,
+        scopes=scopes_dict,
+    )
     print(token)
 
 

@@ -61,7 +61,7 @@ def test_ensure_list_iterable():
 
 
 def test_json_contains_expr_empty_values(mock_session: Any):
-    mock_session.get_bind().dialect.name = "mysql"
+    mock_session.get_bind().dialect.name = "sqlite"
     with pytest.raises(ValueError):
         json_contains_expr(mock_session, DummyColumn(), [])
 
@@ -70,30 +70,6 @@ def test_json_contains_expr_unsupported_dialect(mock_session: Any):
     mock_session.get_bind().dialect.name = "oracle"
     with pytest.raises(RuntimeError):
         json_contains_expr(mock_session, DummyColumn(), ["a"])
-
-
-def test_json_contains_expr_mysql_match_any(mock_session: Any):
-    mock_session.get_bind().dialect.name = "mysql"
-    col = DummyColumn()
-    with patch("mcpgateway.utils.sqlalchemy_modifier.func.json_overlaps", return_value=1):
-        expr = json_contains_expr(mock_session, col, ["a", "b"], match_any=True)
-        assert expr == 1 == 1 or expr == (func.json_overlaps(col, json.dumps(["a", "b"])) == 1)
-
-
-def test_json_contains_expr_mysql_match_all(mock_session: Any):
-    mock_session.get_bind().dialect.name = "mysql"
-    col = DummyColumn()
-    with patch("mcpgateway.utils.sqlalchemy_modifier.func.json_contains", return_value=1):
-        expr = json_contains_expr(mock_session, col, ["a", "b"], match_any=False)
-        assert expr == 1 == 1 or expr == (func.json_contains(col, json.dumps(["a", "b"])) == 1)
-
-
-def test_json_contains_expr_mysql_fallback(mock_session: Any):
-    mock_session.get_bind().dialect.name = "mysql"
-    col = DummyColumn()
-    with patch("mcpgateway.utils.sqlalchemy_modifier.func.json_overlaps", side_effect=Exception("fail")):
-        expr = json_contains_expr(mock_session, col, ["a", "b"], match_any=True)
-        assert isinstance(expr, BooleanClauseList)
 
 
 def test_json_contains_expr_postgresql_match_any(mock_session: Any):
@@ -228,15 +204,36 @@ def test_json_contains_tag_expr_no_bind_collision(mock_session: Any):
 
     # Compile with SQLite to verify params don't collide
     engine = create_engine("sqlite:///:memory:")
-    compiled = combined.compile(engine)
+    try:
+        compiled = combined.compile(engine)
 
-    # All 4 params should be present (2 for each column)
-    assert len(compiled.params) == 4
+        # All 4 params should be present (2 for each column)
+        assert len(compiled.params) == 4
 
-    # Verify all values are present (order doesn't matter due to unique counters)
-    values = set(compiled.params.values())
-    assert values == {"tag1", "tag2", "cat1", "cat2"}
+        # Verify all values are present (order doesn't matter due to unique counters)
+        values = set(compiled.params.values())
+        assert values == {"tag1", "tag2", "cat1", "cat2"}
+    finally:
+        engine.dispose()
 
+
+def test_json_contains_tag_expr_sqlite_redundant_empty_guard(mock_session: Any):
+    """Cover the defensive n==0 guard inside the sqlite branch."""
+    mock_session.get_bind().dialect.name = "sqlite"
+
+    class TruthyEmptyValues:
+        def __bool__(self) -> bool:
+            return True
+
+        def __len__(self) -> int:
+            return 0
+
+        def __iter__(self):
+            return iter(())
+
+    with patch("mcpgateway.utils.sqlalchemy_modifier._ensure_list", return_value=TruthyEmptyValues()):
+        with pytest.raises(ValueError, match="values must be non-empty"):
+            json_contains_tag_expr(mock_session, DummyColumn(name="tags", table_name="tools"), ["ignored"])
 
 def test_json_contains_tag_expr_same_column_no_collision(mock_session: Any):
     """Test that filtering the same column twice doesn't cause collision."""
@@ -250,11 +247,14 @@ def test_json_contains_tag_expr_same_column_no_collision(mock_session: Any):
 
     combined = and_(expr1, expr2)
     engine = create_engine("sqlite:///:memory:")
-    compiled = combined.compile(engine)
+    try:
+        compiled = combined.compile(engine)
 
-    # Both params should be present with unique names
-    assert len(compiled.params) == 2
-    assert set(compiled.params.values()) == {"tag1", "tag2"}
+        # Both params should be present with unique names
+        assert len(compiled.params) == 2
+        assert set(compiled.params.values()) == {"tag1", "tag2"}
+    finally:
+        engine.dispose()
 
 
 # --- Tests for template functions ---

@@ -121,6 +121,13 @@ def test_validate_name_special_chars():
         SecurityValidator.validate_name("bad<name>", "Name")
 
 
+def test_validate_name_html_special_chars_even_if_regex_allows(monkeypatch):
+    """HTML-special-char check is enforced even if NAME_PATTERN is permissive (line 406)."""
+    monkeypatch.setattr(SecurityValidator, "NAME_PATTERN", r"^.+$")
+    with pytest.raises(ValueError, match="HTML special characters"):
+        SecurityValidator.validate_name("ok'name", "Name")
+
+
 def test_validate_name_too_long():
     # MAX_NAME_LENGTH = 10, so 11 chars should fail
     with pytest.raises(ValueError):
@@ -141,6 +148,13 @@ def test_validate_identifier_empty():
 def test_validate_identifier_html():
     with pytest.raises(ValueError):
         SecurityValidator.validate_identifier("bad<id>", "ID")
+
+
+def test_validate_identifier_html_special_chars_even_if_regex_allows(monkeypatch):
+    """HTML-special-char check is enforced even if IDENTIFIER_PATTERN is permissive (line 488)."""
+    monkeypatch.setattr(SecurityValidator, "IDENTIFIER_PATTERN", r"^.+$")
+    with pytest.raises(ValueError, match="HTML special characters"):
+        SecurityValidator.validate_identifier("id'test", "ID")
 
 
 def test_validate_identifier_too_long():
@@ -202,6 +216,13 @@ def test_validate_tool_name_html():
         SecurityValidator.validate_tool_name("bad<tool>")
 
 
+def test_validate_tool_name_html_special_chars_even_if_regex_allows(monkeypatch):
+    """HTML-special-char check is enforced even if TOOL_NAME_PATTERN is permissive (line 597)."""
+    monkeypatch.setattr(SecurityValidator, "TOOL_NAME_PATTERN", r"^[a-zA-Z0-9_].+$")
+    with pytest.raises(ValueError, match="HTML special characters"):
+        SecurityValidator.validate_tool_name("tool'test")
+
+
 def test_validate_tool_name_too_long():
     with pytest.raises(ValueError):
         SecurityValidator.validate_tool_name("a" * 11)
@@ -213,9 +234,9 @@ def test_validate_template_valid():
 
 
 def test_validate_template_too_long():
-    with pytest.raises(ValueError):
-        SecurityValidator.validate_template("a" * 101)
-    SecurityValidator.validate_template("a" * 100)
+    """Template length is now enforced at service layer, not schema validator."""
+    assert SecurityValidator.validate_template("a" * 101) == "a" * 101
+    assert SecurityValidator.validate_template("a" * 100) == "a" * 100
 
 
 def test_validate_template_dangerous_tag():
@@ -240,8 +261,8 @@ def test_validate_url_empty():
 def test_validate_url_too_long():
     # 50 is max, so 51 should fail
     with pytest.raises(ValueError):
-        SecurityValidator.validate_url("http://" + "a" * 44, "URL")
-    SecurityValidator.validate_url("http://" + "a" * 43, "URL")
+        SecurityValidator.validate_url("http://example.com/" + "a" * 32, "URL")
+    SecurityValidator.validate_url("http://example.com/" + "a" * 31, "URL")
 
 
 def test_validate_url_bad_scheme():

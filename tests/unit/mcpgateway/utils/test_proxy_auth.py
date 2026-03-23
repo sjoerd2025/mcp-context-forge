@@ -20,6 +20,8 @@ import pytest
 # First-Party
 from mcpgateway.utils import verify_credentials as vc
 
+TEST_JWT_SECRET = "test-jwt-secret-key-with-minimum-32-bytes"
+
 
 class TestProxyAuthentication:
     """Test cases for proxy authentication functionality."""
@@ -29,13 +31,15 @@ class TestProxyAuthentication:
         """Create mock settings for testing."""
 
         class MockSettings:
-            jwt_secret_key = "test-secret"
+            jwt_secret_key = TEST_JWT_SECRET
             jwt_algorithm = "HS256"
             basic_auth_user = "admin"
             basic_auth_password = "password"
             auth_required = True
+            allow_unauthenticated_admin = False
             mcp_client_auth_enabled = True
             trust_proxy_auth = False
+            trust_proxy_auth_dangerously = False
             proxy_user_header = "X-Authenticated-User"
             require_token_expiration = False
             docs_allow_basic_auth = False
@@ -87,10 +91,26 @@ class TestProxyAuthentication:
             assert result == "anonymous"
 
     @pytest.mark.asyncio
+    async def test_proxy_auth_requires_explicit_dangerous_ack(self, mock_settings, mock_request):
+        """Proxy trust mode must be explicitly acknowledged when MCP auth is disabled."""
+        mock_settings.mcp_client_auth_enabled = False
+        mock_settings.trust_proxy_auth = True
+        mock_settings.trust_proxy_auth_dangerously = False
+        mock_settings.auth_required = True
+        mock_request.headers = {"X-Authenticated-User": "proxy-user"}
+
+        with patch.object(vc, "settings", mock_settings):
+            with pytest.raises(HTTPException) as exc_info:
+                await vc.require_auth(mock_request, None, None)
+            assert exc_info.value.status_code == 401
+            assert "no auth method configured" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
     async def test_proxy_auth_with_header(self, mock_settings, mock_request):
         """Test proxy authentication with user header."""
         mock_settings.mcp_client_auth_enabled = False
         mock_settings.trust_proxy_auth = True
+        mock_settings.trust_proxy_auth_dangerously = True
         mock_request.headers = {"X-Authenticated-User": "proxy-user"}
 
         with patch.object(vc, "settings", mock_settings):
@@ -102,6 +122,7 @@ class TestProxyAuthentication:
         """Test proxy authentication without user header raises 401 when auth_required."""
         mock_settings.mcp_client_auth_enabled = False
         mock_settings.trust_proxy_auth = True
+        mock_settings.trust_proxy_auth_dangerously = True
         mock_settings.auth_required = True
         mock_request.headers = {}  # No proxy header
 
@@ -116,6 +137,7 @@ class TestProxyAuthentication:
         """Test proxy authentication without user header returns anonymous when auth not required."""
         mock_settings.mcp_client_auth_enabled = False
         mock_settings.trust_proxy_auth = True
+        mock_settings.trust_proxy_auth_dangerously = True
         mock_settings.auth_required = False
         mock_request.headers = {}  # No proxy header
 
@@ -128,6 +150,7 @@ class TestProxyAuthentication:
         """Test proxy authentication with custom header name."""
         mock_settings.mcp_client_auth_enabled = False
         mock_settings.trust_proxy_auth = True
+        mock_settings.trust_proxy_auth_dangerously = True
         mock_settings.proxy_user_header = "X-Remote-User"
         mock_request.headers = {"X-Remote-User": "custom-user"}
 
@@ -167,6 +190,7 @@ class TestProxyAuthentication:
 
         mock_settings.mcp_client_auth_enabled = False
         mock_settings.trust_proxy_auth = True
+        mock_settings.trust_proxy_auth_dangerously = True
         mock_request.headers = {"X-Authenticated-User": "proxy-user"}
 
         # Create a valid JWT token
@@ -187,13 +211,15 @@ class TestRBACProxyAuthentication:
         """Create mock settings for testing."""
 
         class MockSettings:
-            jwt_secret_key = "test-secret"
+            jwt_secret_key = TEST_JWT_SECRET
             jwt_algorithm = "HS256"
             basic_auth_user = "admin"
             basic_auth_password = "password"
             auth_required = False
+            allow_unauthenticated_admin = False
             mcp_client_auth_enabled = False
             trust_proxy_auth = True
+            trust_proxy_auth_dangerously = True
             proxy_user_header = "X-Authenticated-User"
             require_token_expiration = False
             docs_allow_basic_auth = False
@@ -281,10 +307,10 @@ class TestRBACProxyAuthentication:
         mock_request.headers = {"X-Authenticated-User": "proxy-user"}
 
         with patch.object(rbac, "settings", mock_settings):
-            # Should ignore proxy header and use JWT flow (returns platform admin when auth not required)
+            # Should ignore proxy header and use JWT flow (auth disabled -> anonymous by default)
             result = await rbac.get_current_user_with_permissions(mock_request, None, None)
-            assert result["email"] == mock_settings.platform_admin_email
-            assert result["auth_method"] == "disabled"
+            assert result["email"] == "anonymous"
+            assert result["auth_method"] == "anonymous"
 
     @pytest.mark.asyncio
     async def test_rbac_proxy_auth_preserves_plugin_context(self, mock_settings, mock_request, mock_db):
@@ -376,6 +402,7 @@ class TestWebSocketAuthentication:
             mock_settings.mcp_client_auth_enabled = True
             mock_settings.auth_required = True
             mock_settings.trust_proxy_auth = False
+            mock_settings.trust_proxy_auth_dangerously = False
 
             # Import and call the websocket_endpoint function
             # First-Party
@@ -386,8 +413,8 @@ class TestWebSocketAuthentication:
             websocket.close.assert_called_once_with(code=1008, reason="Authentication required")
 
     @pytest.mark.asyncio
-    async def test_websocket_with_token_query_param(self):
-        """Test WebSocket authentication with token in query parameters."""
+    async def test_websocket_with_authorization_header(self):
+        """Test WebSocket authentication with bearer token in Authorization header."""
         # Standard
         from unittest.mock import AsyncMock
 
@@ -397,9 +424,9 @@ class TestWebSocketAuthentication:
 
         # Create mock WebSocket
         websocket = AsyncMock(spec=WebSocket)
-        token = jwt.encode({"sub": "test-user"}, "test-secret", algorithm="HS256")
-        websocket.query_params = {"token": token}
-        websocket.headers = {}
+        token = jwt.encode({"sub": "test-user"}, TEST_JWT_SECRET, algorithm="HS256")
+        websocket.query_params = {}
+        websocket.headers = {"authorization": f"Bearer {token}"}
         websocket.accept = AsyncMock()
         websocket.receive_text = AsyncMock(side_effect=Exception("Test complete"))
 
@@ -407,10 +434,12 @@ class TestWebSocketAuthentication:
         with patch("mcpgateway.main.settings") as mock_settings:
             mock_settings.mcp_client_auth_enabled = True
             mock_settings.auth_required = True
+            mock_settings.mcpgateway_ws_relay_enabled = True
             mock_settings.port = 8000
+            mock_settings.trust_proxy_auth_dangerously = False
 
-            # Mock verify_jwt_token to succeed
-            with patch("mcpgateway.main.verify_jwt_token", new=AsyncMock(return_value={"sub": "test-user"})):
+            # Mock websocket auth helper to succeed
+            with patch("mcpgateway.main._authenticate_websocket_user", new=AsyncMock(return_value=(token, None))):
                 # First-Party
                 from mcpgateway.main import websocket_endpoint
 
@@ -443,6 +472,7 @@ class TestWebSocketAuthentication:
         with patch("mcpgateway.main.settings") as mock_settings:
             mock_settings.mcp_client_auth_enabled = False
             mock_settings.trust_proxy_auth = True
+            mock_settings.trust_proxy_auth_dangerously = True
             mock_settings.proxy_user_header = "X-Authenticated-User"
             mock_settings.auth_required = False
             mock_settings.port = 8000
@@ -476,8 +506,9 @@ class TestWebSocketAuthentication:
         with patch("mcpgateway.transports.streamablehttp_transport.settings") as mock_settings:
             mock_settings.mcp_client_auth_enabled = False
             mock_settings.trust_proxy_auth = True
+            mock_settings.trust_proxy_auth_dangerously = True
             mock_settings.proxy_user_header = "X-Authenticated-User"
-            mock_settings.jwt_secret_key = "secret"
+            mock_settings.jwt_secret_key = TEST_JWT_SECRET
             mock_settings.jwt_algorithm = "HS256"
             mock_settings.auth_required = False
 
@@ -497,8 +528,9 @@ class TestWebSocketAuthentication:
         with patch("mcpgateway.transports.streamablehttp_transport.settings") as mock_settings:
             mock_settings.mcp_client_auth_enabled = False
             mock_settings.trust_proxy_auth = True
+            mock_settings.trust_proxy_auth_dangerously = True
             mock_settings.proxy_user_header = "X-Authenticated-User"
-            mock_settings.jwt_secret_key = "secret"
+            mock_settings.jwt_secret_key = TEST_JWT_SECRET
             mock_settings.jwt_algorithm = "HS256"
             mock_settings.auth_required = True
             send = AsyncMock()

@@ -95,6 +95,18 @@ test-results/
 tests/playwright/reports/
 tests/playwright/videos/
 tests/playwright/screenshots/
+tests/jmeter/results/
+tests/async/reports/
+tests/async/profiles/
+tests/migration/reports/
+tests/migration/logs/
+test-results-*.xml
+playwright-report-*.html
+.playwright-cli/
+
+# Vitest
+coverage/
+.vitest/
 
 # ========================================
 # Fuzzing
@@ -102,6 +114,19 @@ tests/playwright/screenshots/
 reports/
 corpus/
 tests/fuzz/fuzzers/results/
+snyk-code-results.json
+snyk-container-results.json
+snyk-iac-compose-results.json
+snyk-iac-docker-results.json
+snyk-helm-results.json
+aibom.json
+sbom-cyclonedx.json
+sbom-spdx.json
+
+# ========================================
+# Security reports
+# ========================================
+docs/docs/security/report.md
 
 # ========================================
 # IDE & Editor
@@ -123,6 +148,7 @@ ipython_config.py
 *.log
 logs/
 logging/
+logs/db-queries.jsonl
 tmp
 tmp/
 temp/
@@ -166,7 +192,8 @@ packages.json
 .aider*
 aider*
 .ai*
-.claude
+.claude/*
+!.claude/skills/
 CLAUDE.local.md
 .continue
 
@@ -226,16 +253,19 @@ celerybeat-schedule
 # ========================================
 uv.lock
 **/uv.lock
+.uv-cache/
+.uv-tmp/
 
 # ========================================
 # Rust (plugins_rust)
 # ========================================
 plugins_rust/target/
+plugins_rust/*/target/
 *.rs.bk
 plugins_rust/Cargo.lock
 
 # ========================================
-# Project-Specific (MCP Gateway)
+# Project-Specific (ContextForge)
 # ========================================
 
 # Certificates & JWT
@@ -268,10 +298,18 @@ todo/
 TODO.md
 FIXMEs
 
+# Upgrade validation outputs
+artifacts/
+artifacts/upgrade-validation*/
+
 # Debug & profiling artifacts
 debug_login_page.png
 docs/pstats.png
+docs/docs/coverage/
 docs/docs/images/coverage.svg
+docs/docs/images/contextforge-*.svg
+docs/docs/design/images/code2flow.dot
+docs/docs/test/
 mcp.prof
 mcp.pstats
 coverage_re
@@ -310,9 +348,19 @@ flagged/
 dictionary.dic
 .config
 
+# Generated reports
+license-check-report.json
+docs/docs/test/license-check-report.json
+
 # Generated performance test files
 nginx.conf
 docker-compose.perf.yml
+
+# Rust MCP runtime profiling artifacts
+tools_rust/mcp_runtime/profiles/
+tools_rust/mcp_runtime/flamegraph*.svg
+tools_rust/mcp_runtime/flamegraph*.html
+tools_rust/mcp_runtime/perf.data*
 
 # JMeter test results and local installation
 tests/jmeter/results/*.jtl

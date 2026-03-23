@@ -16,6 +16,7 @@ This module handles OAuth 2.0 Dynamic Client Registration (DCR) including:
 from datetime import datetime, timezone
 import logging
 from typing import Any, Dict, List
+from urllib.parse import urlsplit
 
 # Third-Party
 import httpx
@@ -62,8 +63,8 @@ class DcrService:
         """Discover AS metadata via RFC 8414.
 
         Tries:
-        1. {issuer}/.well-known/oauth-authorization-server (RFC 8414)
-        2. {issuer}/.well-known/openid-configuration (OIDC fallback)
+        1. RFC 8414: /.well-known/oauth-authorization-server inserted between host and path
+        2. OIDC fallback: {issuer}/.well-known/openid-configuration
 
         Args:
             issuer: The AS issuer URL
@@ -93,7 +94,14 @@ class DcrService:
                 return cached_entry["metadata"]
 
         # Try RFC 8414 path first
-        rfc8414_url = f"{normalized_issuer}/.well-known/oauth-authorization-server"
+        # Per RFC 8414 Section 3.1: "the well-known URI is formed by inserting the
+        # well-known URI string... between the host component and any existing path
+        # component of the issuer's identifier".
+        # See: https://datatracker.ietf.org/doc/html/rfc8414#section-3.1
+        parsed = urlsplit(normalized_issuer)
+        rfc8414_url = f"{parsed.scheme}://{parsed.netloc}/.well-known/oauth-authorization-server"
+        if parsed.path:
+            rfc8414_url += parsed.path
 
         try:
             client = await self._get_client()
@@ -319,6 +327,8 @@ class DcrService:
         # Decrypt registration access token
         encryption = get_encryption_service(self.settings.auth_encryption_secret)
         registration_access_token = await encryption.decrypt_secret_async(client_record.registration_access_token_encrypted)
+        if registration_access_token is None:
+            raise DcrError("Failed to decrypt registration access token for update operation")
 
         # Build update request
         update_request = {"client_id": client_record.client_id, "redirect_uris": orjson.loads(client_record.redirect_uris), "grant_types": orjson.loads(client_record.grant_types)}
@@ -354,22 +364,27 @@ class DcrService:
             db: Database session
 
         Returns:
-            True if deletion succeeded
+            bool: True if deletion succeeded at the Authorization Server.
+                False if deletion failed (missing prerequisites, decryption error, network error).
+                Note: Does not guarantee local database deletion.
 
         Raises:
-            DcrError: If deletion fails (except 404)
+            DcrError: If deletion fails catastrophically
         """
         if not client_record.registration_client_uri:
             logger.warning("Cannot delete client at AS: no registration_client_uri")
-            return True  # Consider it deleted locally
+            return False
 
         if not client_record.registration_access_token_encrypted:
             logger.warning("Cannot delete client at AS: no registration_access_token")
-            return True  # Consider it deleted locally
+            return False
 
         # Decrypt registration access token
         encryption = get_encryption_service(self.settings.auth_encryption_secret)
         registration_access_token = await encryption.decrypt_secret_async(client_record.registration_access_token_encrypted)
+        if registration_access_token is None:
+            logger.error("Failed to decrypt registration access token; cannot authenticate delete request to AS")
+            return False
 
         # Send delete request
         try:
@@ -381,10 +396,10 @@ class DcrService:
                 return True
 
             logger.warning(f"Unexpected status when deleting client: {response.status_code}")
-            return True  # Consider it best-effort
+            return False
         except httpx.HTTPError as e:
-            logger.warning(f"Failed to delete client at AS: {e}")
-            return True  # Best-effort, don't fail if AS is unreachable
+            logger.error(f"Failed to delete client at AS: {e}")
+            return False
 
 
 class DcrError(Exception):

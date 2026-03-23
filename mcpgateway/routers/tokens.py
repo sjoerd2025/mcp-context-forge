@@ -14,6 +14,7 @@ from typing import List, Optional
 
 # Third-Party
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 # First-Party
@@ -28,55 +29,46 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tokens", tags=["tokens"])
 
 
-def _require_interactive_session(current_user: dict) -> None:
-    """Block API token access to token management endpoints.
+def _require_authenticated_session(current_user: dict) -> None:
+    """Block anonymous, unauthenticated, and API-token access to token management endpoints.
 
-    Token management requires interactive sessions (web UI login, SSO, OIDC, etc.)
-    to prevent privilege escalation via token chaining. This is a hard security
-    boundary that applies to ALL users including admins.
-
-    ALLOWED auth_methods:
-    - "jwt": Standard web login
-    - "oauth", "oidc", "saml": SSO providers via plugins
-    - "disabled": Development mode (auth disabled)
-    - Any other plugin-defined method that isn't "api_token"
-
-    BLOCKED:
-    - "api_token": Explicitly blocked
-    - "anonymous": Unauthenticated/missing proxy header
-    - None: Fail-secure - auth flow didn't set auth_method (code bug)
+    Enforces Management Plane isolation: only interactive sessions (JWT from web
+    login, SSO, or OAuth) may create, list, or revoke tokens.  API tokens are
+    Data Plane credentials and must never be able to manage other tokens
+    (token-chaining attack vector).
 
     Args:
         current_user: User context from get_current_user_with_permissions
 
     Raises:
-        HTTPException: 403 if request is from an API token or auth_method not set
+        HTTPException: 403 if auth_method is None, anonymous, or api_token
     """
     auth_method = current_user.get("auth_method")
 
     # Fail-secure: block if auth_method not set (indicates incomplete auth flow)
     if auth_method is None:
-        logger.warning("Token management blocked: auth_method not set. " "This indicates an auth code path that needs to set request.state.auth_method")
+        logger.warning("Token management blocked: auth_method not set. This indicates an auth code path that needs to set request.state.auth_method")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Token management requires interactive session. " "Authentication method could not be determined.",
-        )
-
-    # Block API tokens explicitly
-    if auth_method == "api_token":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Token management requires interactive session (web login). " "API tokens cannot create, modify, or revoke tokens.",
+            detail="Token management requires authentication. Authentication method could not be determined.",
         )
 
     # Block anonymous users (missing proxy header or unauthenticated)
     if auth_method == "anonymous":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Token management requires interactive session (web login). " "Anonymous access is not permitted.",
+            detail="Token management requires authentication. Anonymous access is not permitted.",
         )
 
-    # All other auth_methods (jwt, oauth, oidc, saml, proxy, disabled, etc.) are allowed
+    # Block API tokens from managing other tokens (Management Plane isolation).
+    # Token CRUD endpoints require an interactive session (JWT from web login or SSO).
+    # Allowing API tokens here would let a compromised token create new long-lived
+    # tokens and escalate persistence — a token-chaining attack.
+    if auth_method == "api_token":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=("Token management requires an interactive session (JWT from web login or SSO). " "API tokens cannot create, list, or revoke other tokens."),
+        )
 
 
 async def _get_caller_permissions(
@@ -130,14 +122,26 @@ async def create_token(
         >>> asyncio.iscoroutinefunction(create_token)
         True
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
+
+    # Auto-inherit team_id from the caller's single team when not explicitly provided.
+    # This prevents tokens from being silently scoped to public-only (team_id=None)
+    # when the user belongs to exactly one team, maintaining RBAC context at token level.
+    # Multi-team users must specify team_id explicitly to avoid ambiguity.
+    # Admins with teams=null are exempt and may still create global-scope tokens.
+    effective_team_id = request.team_id
+    if effective_team_id is None and not current_user.get("is_admin"):
+        user_teams = current_user.get("token_teams") or []
+        if len(user_teams) == 1:
+            effective_team_id = user_teams[0]
+            logger.debug("Auto-inherited team_id=%s for token creation by %s", effective_team_id, current_user["email"])
 
     service = TokenCatalogService(db)
 
     # Get caller permissions for scope containment (if custom scope requested)
     caller_permissions = None
     if request.scope and request.scope.permissions:
-        caller_permissions = await _get_caller_permissions(db, current_user, request.team_id)
+        caller_permissions = await _get_caller_permissions(db, current_user, effective_team_id)
 
     # Convert request to TokenScope if provided
     scope = None
@@ -158,7 +162,7 @@ async def create_token(
             scope=scope,
             expires_in_days=request.expires_in_days,
             tags=request.tags,
-            team_id=request.team_id,
+            team_id=effective_team_id,
             caller_permissions=caller_permissions,
             is_active=request.is_active,
         )
@@ -190,6 +194,22 @@ async def create_token(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except IntegrityError as e:
+        db.rollback()
+        err_str = str(e.orig) if hasattr(e, "orig") and e.orig else str(e)
+        # Match the specific name constraint: PostgreSQL reports the constraint name
+        # (either the db.py name or the Alembic migration name); SQLite reports column paths.
+        if (
+            "uq_email_api_tokens_user_name_team" in err_str
+            or "uq_email_api_tokens_user_name" in err_str
+            or "uq_email_api_tokens_user_email_name" in err_str
+            or ("email_api_tokens.user_email" in err_str and "email_api_tokens.name" in err_str)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A token with this name already exists for this user in the same team scope. Token names must be unique per user per team. Please choose a different name.",
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Token creation failed due to a conflict. Please try again.")
 
 
 @router.get("", response_model=TokenListResponse)
@@ -218,20 +238,27 @@ async def list_tokens(
         >>> asyncio.iscoroutinefunction(list_tokens)
         True
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     service = TokenCatalogService(db)
-    tokens = await service.list_user_tokens(
+    tokens = await service.list_user_and_team_tokens(
         user_email=current_user["email"],
         include_inactive=include_inactive,
         limit=limit,
         offset=offset,
     )
 
+    total_count = await service.count_user_and_team_tokens(
+        user_email=current_user["email"],
+        include_inactive=include_inactive,
+    )
+
+    # Batch fetch revocation info (single query instead of N+1)
+    revocation_map = await service.get_token_revocations_batch([t.jti for t in tokens])
+
     token_responses = []
     for token in tokens:
-        # Check if token is revoked
-        revocation_info = await service.get_token_revocation(token.jti)
+        revocation_info = revocation_map.get(token.jti)
 
         token_responses.append(
             TokenResponse(
@@ -259,7 +286,7 @@ async def list_tokens(
 
     db.commit()
     db.close()
-    return TokenListResponse(tokens=token_responses, total=len(token_responses), limit=limit, offset=offset)
+    return TokenListResponse(tokens=token_responses, total=total_count, limit=limit, offset=offset)
 
 
 @router.get("/{token_id}", response_model=TokenResponse)
@@ -287,7 +314,7 @@ async def get_token(
         >>> asyncio.iscoroutinefunction(get_token)
         True
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     service = TokenCatalogService(db)
     token = await service.get_token(token_id, current_user["email"])
@@ -338,7 +365,7 @@ async def update_token(
     Raises:
         HTTPException: If token not found or validation fails
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     service = TokenCatalogService(db)
 
@@ -421,7 +448,7 @@ async def revoke_token(
     Raises:
         HTTPException: If token not found
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     service = TokenCatalogService(db)
 
@@ -463,7 +490,7 @@ async def get_token_usage_stats(
     Raises:
         HTTPException: If token not found or not owned by user
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     service = TokenCatalogService(db)
 
@@ -505,7 +532,7 @@ async def list_all_tokens(
     Raises:
         HTTPException: If user is not admin
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     if not current_user["is_admin"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
@@ -520,15 +547,27 @@ async def list_all_tokens(
             limit=limit,
             offset=offset,
         )
+        total_count = await service.count_user_tokens(
+            user_email=user_email,
+            include_inactive=include_inactive,
+        )
     else:
-        # This would need a new method in service for all tokens
-        # For now, return empty list - can implement later if needed
-        tokens = []
+        # Admin: get all tokens
+        tokens = await service.list_all_tokens(
+            include_inactive=include_inactive,
+            limit=limit,
+            offset=offset,
+        )
+        total_count = await service.count_all_tokens(
+            include_inactive=include_inactive,
+        )
+
+    # Batch fetch revocation info (single query instead of N+1)
+    revocation_map = await service.get_token_revocations_batch([t.jti for t in tokens])
 
     token_responses = []
     for token in tokens:
-        # Check if token is revoked
-        revocation_info = await service.get_token_revocation(token.jti)
+        revocation_info = revocation_map.get(token.jti)
 
         token_responses.append(
             TokenResponse(
@@ -556,7 +595,7 @@ async def list_all_tokens(
 
     db.commit()
     db.close()
-    return TokenListResponse(tokens=token_responses, total=len(token_responses), limit=limit, offset=offset)
+    return TokenListResponse(tokens=token_responses, total=total_count, limit=limit, offset=offset)
 
 
 @router.delete("/admin/{token_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["admin"])
@@ -577,7 +616,7 @@ async def admin_revoke_token(
     Raises:
         HTTPException: If user is not admin or token not found
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     if not current_user["is_admin"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
@@ -623,7 +662,7 @@ async def create_team_token(
     Raises:
         HTTPException: If user is not team owner or validation fails
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     service = TokenCatalogService(db)
 
@@ -683,6 +722,22 @@ async def create_team_token(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except IntegrityError as e:
+        db.rollback()
+        err_str = str(e.orig) if hasattr(e, "orig") and e.orig else str(e)
+        # Match the specific name constraint: PostgreSQL reports the constraint name
+        # (either the db.py name or the Alembic migration name); SQLite reports column paths.
+        if (
+            "uq_email_api_tokens_user_name_team" in err_str
+            or "uq_email_api_tokens_user_name" in err_str
+            or "uq_email_api_tokens_user_email_name" in err_str
+            or ("email_api_tokens.user_email" in err_str and "email_api_tokens.name" in err_str)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A token with this name already exists for this user in the same team scope. Token names must be unique per user per team. Please choose a different name.",
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Token creation failed due to a conflict. Please try again.")
 
 
 @router.get("/teams/{team_id}", response_model=TokenListResponse)
@@ -695,23 +750,23 @@ async def list_team_tokens(
     current_user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ) -> TokenListResponse:
-    """List API tokens for a team (only team owners can do this).
+    """List API tokens for a team (requires active team membership).
 
     Args:
         team_id: Team ID to list tokens for
         include_inactive: Include inactive/expired tokens
         limit: Maximum number of tokens to return (default 50)
         offset: Number of tokens to skip for pagination
-        current_user: Authenticated user (must be team owner)
+        current_user: Authenticated user (must be an active member of the team)
         db: Database session
 
     Returns:
-        TokenListResponse: List of teams API tokens
+        TokenListResponse: List of team's API tokens
 
     Raises:
-        HTTPException: If user is not team owner
+        HTTPException: If user is not an active member of the team
     """
-    _require_interactive_session(current_user)
+    _require_authenticated_session(current_user)
 
     service = TokenCatalogService(db)
 
@@ -724,10 +779,17 @@ async def list_team_tokens(
             offset=offset,
         )
 
+        total_count = await service.count_team_tokens(
+            team_id=team_id,
+            include_inactive=include_inactive,
+        )
+
+        # Batch fetch revocation info (single query instead of N+1)
+        revocation_map = await service.get_token_revocations_batch([t.jti for t in tokens])
+
         token_responses = []
         for token in tokens:
-            # Check if token is revoked
-            revocation_info = await service.get_token_revocation(token.jti)
+            revocation_info = revocation_map.get(token.jti)
 
             token_responses.append(
                 TokenResponse(
@@ -755,6 +817,6 @@ async def list_team_tokens(
 
         db.commit()
         db.close()
-        return TokenListResponse(tokens=token_responses, total=len(token_responses), limit=limit, offset=offset)
+        return TokenListResponse(tokens=token_responses, total=total_count, limit=limit, offset=offset)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

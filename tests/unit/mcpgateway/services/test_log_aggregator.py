@@ -30,12 +30,6 @@ class TestIsPostgresql:
             mock_engine.dialect.name = "sqlite"
             assert _is_postgresql() is False
 
-    def test_is_postgresql_false_mysql(self):
-        """Test PostgreSQL detection returns False for MySQL."""
-        with patch("mcpgateway.services.log_aggregator.engine") as mock_engine:
-            mock_engine.dialect.name = "mysql"
-            assert _is_postgresql() is False
-
 
 class TestLogAggregatorPercentiles:
     """Tests for LogAggregator percentile computation."""
@@ -808,7 +802,7 @@ class TestAggregateCustomWindowsFallback:
         assert mock_aggregator.aggregate_all_components.call_count > 0
 
 
-class TestAggregatePerformanceMetrics:
+class TestAggregatePerformanceMetricsAdditional:
     """Tests for aggregate_performance_metrics and related helpers."""
 
     def test_aggregate_performance_metrics_success(self):

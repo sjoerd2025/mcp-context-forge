@@ -1,6 +1,6 @@
 # Multi-Tenancy Architecture
 
-The MCP Gateway implements a comprehensive multi-tenant architecture that provides secure isolation, flexible resource sharing, and granular access control. This document describes the complete multi-tenancy design, user lifecycle, team management, and resource scoping mechanisms.
+ContextForge implements a comprehensive multi-tenant architecture that provides secure isolation, flexible resource sharing, and granular access control. This document describes the complete multi-tenancy design, user lifecycle, team management, and resource scoping mechanisms.
 
 ## Overview
 
@@ -286,8 +286,9 @@ Applies to Tools, Servers, Resources, Prompts, and A2A Agents. All resources are
 
 - Private:
 
-  - Who sees it: Only the resource owner (owner_email).
+  - Who sees it: Only the resource owner (owner_email), and only when their token is not a public-only token (token_teams must be non-empty).
   - Team members cannot see or use it unless they are the owner.
+  - Public-only tokens (token_teams=[]) cannot access private resources even as the owner.
   - Mutations: Owner and Platform Admin can update/delete; team owners may be allowed by policy (see Enhancements).
 
 - Team:
@@ -302,7 +303,9 @@ Applies to Tools, Servers, Resources, Prompts, and A2A Agents. All resources are
 
 Enforcement summary:
 
-- Listing queries include resources where (a) owner_email == user.email, (b) team_id ∈ user_teams with visibility ∈ {team, public}, and (c) visibility == public.
+- Listing queries include resources where (a) visibility == public, (b) team_id ∈ token_teams with visibility ∈ {team, public}, or (c) owner_email == user.email with visibility == private.
+- Owner-based access applies only to private resources. Owners cannot use ownership to bypass team scoping for team-visibility resources outside their token scope.
+- Public-only tokens (token_teams=[]) see only public resources — owner and team access are both suppressed.
 - Read follows the same rules as list; write operations require ownership or delegated/team administrative rights.
 
 ---
@@ -352,7 +355,7 @@ The `normalize_token_teams()` function returns:
 
 ## Two-Layer Security Model
 
-MCP Gateway implements two distinct security layers that work together:
+ContextForge implements two distinct security layers that work together:
 
 ### Layer 1: Token Scoping (Data Filtering)
 
@@ -407,7 +410,7 @@ Request: POST /tools/{id}/execute
 | Admin UI | ✅ | ✅ | Permission-based rendering |
 | Service Layer | ✅ | N/A | Database query filtering |
 | WebSocket | ✅ | ✅ | Forwards auth to /rpc |
-| MCP Transport | ✅ | N/A | Streamable HTTP filtering |
+| MCP Transport | ✅ | N/A | Streamable HTTP filtering + per-server OAuth enforcement |
 
 ---
 
@@ -415,7 +418,7 @@ Request: POST /tools/{id}/execute
 
 ### Resource Architecture
 
-All resources in the MCP Gateway are scoped to teams with three visibility levels:
+All resources in ContextForge are scoped to teams with three visibility levels:
 
 ```mermaid
 flowchart TD
@@ -541,7 +544,7 @@ flowchart TD
 
 ## Role-Based Access Control (RBAC)
 
-The MCP Gateway implements a comprehensive RBAC system with four built-in roles that are automatically created during system bootstrap. These roles provide granular permission management across different scopes.
+ContextForge implements a comprehensive RBAC system with four built-in roles that are automatically created during system bootstrap. These roles provide granular permission management across different scopes.
 
 ### System Roles
 
@@ -722,81 +725,28 @@ sequenceDiagram
 
 ## Password Management
 
-### Changing Platform Admin Password
+ContextForge now supports:
 
-The platform admin password can be changed using several methods:
+- Self-service forgot-password/reset flow:
+  - `POST /auth/email/forgot-password`
+  - `GET /auth/email/reset-password/{token}`
+  - `POST /auth/email/reset-password/{token}`
+- Admin unlock flow:
+  - `POST /auth/email/admin/users/{email}/unlock`
+- Admin password reset via UI and API (`PUT /auth/email/admin/users/{email}`)
 
-#### Method 1: Admin UI (Easiest)
-Use the web interface to change passwords:
+Operational guidance, Kubernetes recovery commands, emergency SQL procedures, and
+SMTP/reset configuration are documented in:
 
-1. Navigate to [http://localhost:4444/admin/#users](http://localhost:4444/admin/#users)
-2. Click "Edit" on the user account
-3. Enter a new password in the "New Password" field (leave empty to keep current password)
-4. Confirm the password in the "Confirm New Password" field
-5. Click "Update User"
-
-**Note**: Both password fields must match for the update to succeed. The form will prevent submission if passwords don't match.
-
-#### Method 2: API Endpoint
-Use the `/auth/email/change-password` endpoint after authentication:
-
-```bash
-# First, get a JWT token by logging in
-curl -X POST "http://localhost:4444/auth/email/login" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "admin@example.com",
-    "password": "current_password"
-  }'
-
-# Use the returned JWT token to change password
-curl -X POST "http://localhost:4444/auth/email/change-password" \
-  -H "Authorization: Bearer " \
-  -H "Content-Type: application/json" \
-  -d '{
-    "old_password": "current_password",
-    "new_password": "new_secure_password"
-  }'
-```
-
-#### Method 3: Environment Variable + Migration
-1. Update `PLATFORM_ADMIN_PASSWORD` in your `.env` file
-2. Run database migration to apply the change:
-   ```bash
-   alembic upgrade head
-   ```
-
-**Note**: This method only works during initial setup. After the admin user exists, the environment variable is ignored.
-
-#### Method 4: Direct Database Update
-For emergency password resets, you can update the database directly:
-
-```bash
-# Using the application's password service
-python3 -c "
-from mcpgateway.services.argon2_service import Argon2PasswordService
-from mcpgateway.db import SessionLocal
-from mcpgateway.common.models import EmailUser
-
-service = Argon2PasswordService()
-hashed = service.hash_password('new_password')
-
-with SessionLocal() as db:
-    user = db.query(EmailUser).filter(EmailUser.email == 'admin@example.com').first()
-    if user:
-        user.password_hash = hashed
-        db.commit()
-        print('Password updated successfully')
-    else:
-        print('Admin user not found')
-"
-```
+- [Management: Password Management & Recovery](../manage/password-management.md)
 
 ### Password Security Requirements
-- Minimum 8 characters (enforced by application)
-- Uses Argon2id hashing algorithm for secure storage
-- Password change events are logged in the audit trail
-- Failed login attempts are tracked and can trigger account lockout
+
+- Argon2id hashing for stored credentials
+- One-time reset tokens (hashed in DB, configurable expiry)
+- Password reset request rate limiting
+- Failed login tracking and account lockout controls
+- Audit events for login/reset/lockout/unlock actions
 
 ### Role-Based UI Experience
 
@@ -1147,13 +1097,18 @@ sequenceDiagram
 
 # Team Settings
 AUTO_CREATE_PERSONAL_TEAMS=true
-PERSONAL_TEAM_PREFIX=personal
+# PERSONAL_TEAM_PREFIX=personal  # optional: set to get collision-safe email-based slugs
 MAX_TEAMS_PER_USER=50
-MAX_MEMBERS_PER_TEAM=100
+MAX_MEMBERS_PER_TEAM=100        # platform admins are exempt from this cap
 
 # Team Invitation Settings
 INVITATION_EXPIRY_DAYS=7
 REQUIRE_EMAIL_VERIFICATION_FOR_INVITES=true
+
+# Team Governance
+ALLOW_TEAM_CREATION=true
+ALLOW_TEAM_JOIN_REQUESTS=true
+ALLOW_TEAM_INVITATIONS=true
 
 # Visibility
 # NOTE: Resources default to 'private' (not configurable via env today)
@@ -1262,11 +1217,12 @@ These behaviors are enforced consistently across all access paths:
 
 1. `normalize_token_teams()` is the ONLY function that interprets JWT team claims
 2. Missing `teams` key always returns `[]` (public-only, secure default)
-3. Admin bypass requires BOTH `teams: null` AND `is_admin: true`
+3. Admin bypass requires BOTH `teams: null` AND `is_admin: true`, and both `token_teams=None` AND `user_email=None` in the service layer
 4. Empty teams list (`[]`) results in public-only access, even for admins
 5. All list endpoints pass `token_teams` to the service layer
-6. Service layer applies visibility filtering based on `token_teams`
-7. Public-only tokens can ONLY access `visibility='public'` resources
+6. Service layer applies visibility filtering based on `token_teams` via `BaseService._apply_access_control()`
+7. Public-only tokens can ONLY access `visibility='public'` resources — owner and team access are both suppressed
+8. Owner-based access (`owner_email`) grants visibility only for `visibility='private'` resources — it does not bypass team scoping for team-visibility resources
 
 ### Related Documentation
 

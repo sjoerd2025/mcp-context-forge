@@ -5,7 +5,7 @@
 
 ## Overview
 
-The MCP Context Forge Plugin Framework provides a comprehensive, production-grade system for extending gateway functionality through pre/post processing hooks at various points in the MCP request lifecycle. The framework supports both high-performance native plugins and sophisticated external AI service integrations.
+ContextForge Plugin Framework provides a comprehensive, production-grade system for extending gateway functionality through pre/post processing hooks at various points in the MCP request lifecycle. The framework supports both high-performance native plugins and sophisticated external AI service integrations.
 
 ### Key Capabilities
 
@@ -27,10 +27,18 @@ Enable the plugin framework in your `.env` file:
 PLUGINS_ENABLED=true
 
 # Optional: Custom plugin config path
-PLUGIN_CONFIG_FILE=plugins/config.yaml
+PLUGINS_CONFIG_FILE=plugins/config.yaml
 ```
 
 If deploying the gateway as a container, set these environment variables in your compose file or in the container's `run` command.
+
+!!! note "Plugin Framework Settings"
+    The plugin framework has its own pydantic settings configuration with a `PLUGINS_` env var
+    prefix. `PLUGINS_ENABLED`, `PLUGINS_CONFIG_FILE`, and `PLUGINS_CLI_*` are shared — the same env var
+    is read by both the gateway and the plugin framework. The plugin framework also has its own HTTP client
+    and SSL settings (e.g., `PLUGINS_HTTPX_CONNECT_TIMEOUT`, `PLUGINS_SKIP_SSL_VERIFY`) that are independent
+    of the gateway's. See [Plugin Configuration Reference](../../manage/configuration-plugins.md)
+    for the full list.
 
 ## Architecture
 
@@ -47,11 +55,12 @@ The plugin framework implements a **hybrid architecture** supporting both native
 - **Examples:** `PIIFilterPlugin`, `SearchReplacePlugin`, `DenyListPlugin`
 
 ### External Service Plugins
-- **MCP Integration:** External plugins communicate via MCP using STDIO or Streamable HTTP
+- **Multiple Transports:** External plugins can communicate via MCP (STDIO/HTTP) or high-performance gRPC
 - **Enterprise AI Support:** LlamaGuard, OpenAI Moderation, custom ML models
 - **Independent Scaling:** Services run outside the gateway and can scale separately
 - **Use Cases:** Advanced AI safety, complex ML inference, policy engines (e.g., OPA)
 - **Examples:** OPA external plugin server, LlamaGuard integration, OpenAI Moderation
+- **Performance:** gRPC provides ~8x throughput vs MCP/HTTP (~4,700 vs ~600 calls/sec)
 
 ### Gunicorn Workers and External Transports
 
@@ -135,7 +144,7 @@ plugins:
 
 ```yaml
 plugins:
-
+  # MCP/HTTP transport (default)
   - name: "MyExternal"
     kind: "external"
     priority: 10
@@ -143,11 +152,22 @@ plugins:
       proto: STREAMABLEHTTP
       url: http://localhost:8000/mcp
       # uds: /var/run/mcp-plugin.sock  # use UDS instead of TCP
+
+  # gRPC transport (high performance - ~8x faster)
+  - name: "MyGrpcPlugin"
+    kind: "external"
+    priority: 10
+    grpc:
+      target: "localhost:50051"
+      # uds: /var/run/grpc-plugin.sock  # use UDS instead of TCP
 ```
+
+!!! tip "High-Performance Transports"
+    For performance-critical deployments, consider [gRPC transport](./grpc-transport.md) (~4,700 calls/sec) or [Unix socket transport](./unix-socket-transport.md) (~9,000 calls/sec) compared to ~600 calls/sec with MCP/HTTP.
 
 ### Plugin Configuration
 
-The plugin configuration file is used to configure a set of plugins that implement hook functions used to register to hook points throughout the MCP Context Forge. An example configuration
+The plugin configuration file is used to configure a set of plugins that implement hook functions used to register to hook points throughout ContextForge. An example configuration
 is below. It contains two main sections: `plugins` and `plugin_settings`.
 
 !!! details "Plugin Configuration"
@@ -254,7 +274,7 @@ plugin_settings:
   plugin_health_check_interval: 60
 ```
 
-2. Ensure `.env` contains: `PLUGINS_ENABLED=true` and `PLUGIN_CONFIG_FILE=plugins/config.yaml`.
+2. Ensure `.env` contains: `PLUGINS_ENABLED=true` and `PLUGINS_CONFIG_FILE=plugins/config.yaml`.
 3. Start the gateway: `make dev` (or `make serve`).
 
 That's it — the gateway now runs the enabled plugins at the selected hook points.
@@ -262,7 +282,7 @@ That's it — the gateway now runs the enabled plugins at the selected hook poin
 ### Plugin Configuration
 
 The `plugins` section lists the set of configured plugins that will be loaded
-by the Context Forge at startup.  Each plugin contains a set of standard configurations,
+by ContextForge at startup.  Each plugin contains a set of standard configurations,
 and then a `config` section designed for plugin specific configurations. The attributes
 are defined as follows:
 
@@ -1099,7 +1119,7 @@ async def test_my_plugin():
 
 Errors inside a plugin should be raised as exceptions.  The plugin manager will catch the error, and its behavior depends on both the gateway's and plugin's configuration as follows:
 
-1. if `plugin_settings.fail_on_plugin_error` in the plugin `config.yaml` is set to `true` the exception is bubbled up as a PluginError and the error is passed to the client of the MCP Context Forge regardless of the plugin mode.
+1. if `plugin_settings.fail_on_plugin_error` in the plugin `config.yaml` is set to `true` the exception is bubbled up as a PluginError and the error is passed to the client of ContextForge regardless of the plugin mode.
 2. if `plugin_settings.fail_on_plugin_error` is set to false the error is handled based off of the plugin mode in the plugin's config as follows:
 
   * if `mode` is `enforce`, both violations and errors are bubbled up as exceptions and the execution is blocked.

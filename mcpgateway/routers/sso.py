@@ -9,6 +9,7 @@ Handles SSO login flows, provider configuration, and callback handling.
 """
 
 # Standard
+import secrets
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -23,6 +24,7 @@ from mcpgateway.db import get_db
 from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.sso_service import SSOService
+from mcpgateway.utils.log_sanitizer import sanitize_for_log
 
 # Initialize logging
 logging_service = LoggingService()
@@ -42,6 +44,7 @@ class SSOProviderCreateRequest(BaseModel):
     token_url: str
     userinfo_url: str
     issuer: Optional[str] = None
+    jwks_uri: Optional[str] = None
     scope: str = "openid profile email"
     trusted_domains: List[str] = []
     auto_create_users: bool = True
@@ -61,6 +64,7 @@ class SSOProviderUpdateRequest(BaseModel):
     token_url: Optional[str] = None
     userinfo_url: Optional[str] = None
     issuer: Optional[str] = None
+    jwks_uri: Optional[str] = None
     scope: Optional[str] = None
     trusted_domains: Optional[List[str]] = None
     auto_create_users: Optional[bool] = None
@@ -180,11 +184,12 @@ def _validate_redirect_uri(redirect_uri: str, request: Request | None = None) ->
 
     # Check against app_domain (if configured)
     if hasattr(settings, "app_domain") and settings.app_domain:
-        # app_domain is typically just a hostname, allow both http and https
-        app_domain = settings.app_domain.lower()
-        if redirect_host == app_domain:
+        # app_domain is an HttpUrl - extract the hostname for comparison
+        app_domain_host = urlparse(str(settings.app_domain)).hostname or ""
+        app_domain_host = app_domain_host.lower()
+        if redirect_host == app_domain_host:
             # Only allow HTTPS in production, or HTTP for localhost
-            if redirect_scheme == "https" or (redirect_scheme == "http" and app_domain in ("localhost", "127.0.0.1")):
+            if redirect_scheme == "https" or (redirect_scheme == "http" and app_domain_host in ("localhost", "127.0.0.1")):
                 return True
 
     # Check against allowed_origins (full origin match including scheme and port)
@@ -212,6 +217,7 @@ def _validate_redirect_uri(redirect_uri: str, request: Request | None = None) ->
 async def initiate_sso_login(
     provider_id: str,
     request: Request,
+    response: Response,
     redirect_uri: str = Query(..., description="Callback URI after authentication"),
     scopes: Optional[str] = Query(None, description="Space-separated OAuth scopes"),
     db: Session = Depends(get_db),
@@ -225,6 +231,7 @@ async def initiate_sso_login(
     Args:
         provider_id: SSO provider identifier (e.g., 'github', 'google')
         request: FastAPI request object
+        response: FastAPI response object used to set session-binding cookie
         redirect_uri: Callback URI after successful authentication
         scopes: Optional custom OAuth scopes (space-separated)
         db: Database session
@@ -246,7 +253,8 @@ async def initiate_sso_login(
     # Validate redirect_uri to prevent open redirect attacks
     # Uses server-side allowlist (allowed_origins, app_domain) - does NOT trust Host header
     if not _validate_redirect_uri(redirect_uri, request):
-        logger.warning(f"SSO login rejected - invalid redirect_uri: {redirect_uri}")
+        # Sanitize untrusted redirect_uri before logging to prevent log injection
+        logger.warning(f"SSO login rejected - invalid redirect_uri: {sanitize_for_log(redirect_uri)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid redirect_uri. Must be a relative path or URL matching allowed origins.",
@@ -254,8 +262,13 @@ async def initiate_sso_login(
 
     sso_service = SSOService(db)
     scope_list = scopes.split() if scopes else None
+    browser_session_binding = secrets.token_urlsafe(32)
 
-    auth_url = sso_service.get_authorization_url(provider_id, redirect_uri, scope_list)
+    try:
+        auth_url = sso_service.get_authorization_url(provider_id, redirect_uri, scope_list, session_binding=browser_session_binding)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     if not auth_url:
         raise HTTPException(status_code=404, detail=f"SSO provider '{provider_id}' not found or disabled")
 
@@ -266,6 +279,16 @@ async def initiate_sso_login(
     parsed = urllib.parse.urlparse(auth_url)
     params = urllib.parse.parse_qs(parsed.query)
     state = params.get("state", [""])[0]
+
+    use_secure = (settings.environment == "production") or settings.secure_cookies
+    response.set_cookie(
+        key="sso_session_id",
+        value=browser_session_binding,
+        httponly=True,
+        secure=use_secure,
+        samesite=settings.cookie_samesite,
+        path=settings.app_root_path or "/",
+    )
 
     return SSOLoginResponse(authorization_url=auth_url, state=state)
 
@@ -308,8 +331,21 @@ async def handle_sso_callback(
 
     sso_service = SSOService(db)
 
-    # Handle OAuth callback
-    user_info = await sso_service.handle_oauth_callback(provider_id, code, state)
+    # Handle OAuth callback — returns (user_info, token_data) or None
+    user_info: Optional[Dict[str, object]] = None
+    token_data: Dict[str, object] = {}
+
+    browser_session_binding = request.cookies.get("sso_session_id") if request else None
+    if not browser_session_binding:
+        # Third-Party
+        from fastapi.responses import RedirectResponse
+
+        return RedirectResponse(url=f"{root_path}/admin/login?error=sso_failed", status_code=302)
+
+    callback_result = await sso_service.handle_oauth_callback_with_tokens(provider_id, code, state, session_binding=browser_session_binding)
+    if callback_result:
+        user_info, token_data = callback_result
+
     if not user_info:
         # Redirect back to login with error
         # Third-Party
@@ -334,9 +370,34 @@ async def handle_sso_callback(
 
     # Set secure HTTP-only cookie using the same method as email auth
     # First-Party
-    from mcpgateway.utils.security_cookies import set_auth_cookie
+    from mcpgateway.utils.security_cookies import CookieTooLargeError, set_auth_cookie
 
-    set_auth_cookie(redirect_response, access_token, remember_me=False)
+    try:
+        set_auth_cookie(redirect_response, access_token, remember_me=False)
+    except CookieTooLargeError:
+        redirect_response = RedirectResponse(
+            url=f"{root_path}/admin/login?error=token_too_large",
+            status_code=302,
+        )
+        return redirect_response
+
+    # Persist Keycloak ID token as short-lived, HTTP-only hint for RP-initiated logout.
+    # Without id_token_hint, some Keycloak versions show confirmation and may preserve SSO.
+    id_token = token_data.get("id_token")
+    if provider_id == "keycloak" and isinstance(id_token, str) and id_token:
+        if len(id_token) > 3800:  # Leave room for cookie metadata within browser 4KB limit
+            logger.warning("Keycloak id_token too large for cookie storage. RP-initiated logout will not include id_token_hint.")
+        else:
+            use_secure = (settings.environment == "production") or settings.secure_cookies
+            redirect_response.set_cookie(
+                key="sso_id_token_hint",
+                value=id_token,
+                max_age=settings.token_expiry * 60,  # match session token lifetime
+                httponly=True,
+                secure=use_secure,
+                samesite=settings.cookie_samesite,
+                path=settings.app_root_path or "/",
+            )
 
     return redirect_response
 
@@ -369,7 +430,10 @@ async def create_sso_provider(
     if existing:
         raise HTTPException(status_code=409, detail=f"SSO provider '{provider_data.id}' already exists")
 
-    provider = await sso_service.create_provider(provider_data.dict())
+    try:
+        provider = await sso_service.create_provider(provider_data.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     result = {
         "id": provider.id,
@@ -464,6 +528,7 @@ async def get_sso_provider(
         "token_url": provider.token_url,
         "userinfo_url": provider.userinfo_url,
         "issuer": provider.issuer,
+        "jwks_uri": provider.jwks_uri,
         "scope": provider.scope,
         "trusted_domains": provider.trusted_domains,
         "auto_create_users": provider.auto_create_users,
@@ -471,6 +536,7 @@ async def get_sso_provider(
         "is_enabled": provider.is_enabled,
         "created_at": provider.created_at,
         "updated_at": provider.updated_at,
+        "provider_metadata": provider.provider_metadata,
     }
     db.commit()
     db.close()
@@ -502,11 +568,15 @@ async def update_sso_provider(
     sso_service = SSOService(db)
 
     # Filter out None values
-    update_data = {k: v for k, v in provider_data.dict().items() if v is not None}
+    update_data = {k: v for k, v in provider_data.model_dump().items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No update data provided")
 
-    provider = await sso_service.update_provider(provider_id, update_data)
+    try:
+        provider = await sso_service.update_provider(provider_id, update_data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if not provider:
         raise HTTPException(status_code=404, detail=f"SSO provider '{provider_id}' not found")
 

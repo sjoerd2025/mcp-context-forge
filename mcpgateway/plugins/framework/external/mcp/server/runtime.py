@@ -60,21 +60,30 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 # Third-Party
+from fastapi import Response, status
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from prometheus_client import Gauge, generate_latest, REGISTRY
 import uvicorn
 
 # First-Party
 from mcpgateway.plugins.framework import ExternalPluginServer, MCPServerConfig
 from mcpgateway.plugins.framework.constants import GET_PLUGIN_CONFIG, GET_PLUGIN_CONFIGS, INVOKE_HOOK, MCP_SERVER_INSTRUCTIONS, MCP_SERVER_NAME
+from mcpgateway.plugins.framework.settings import get_transport_settings
 
 logger = logging.getLogger(__name__)
 
 SERVER: ExternalPluginServer | None = None
 
+PLUGIN_INFO = Gauge(
+    "plugin_info",
+    "Plugin server information",
+    ["server_name", "transport", "ssl_enabled"],
+    registry=REGISTRY,
+)
 
 # Module-level tool functions (extracted for testability)
 
@@ -290,7 +299,7 @@ class SSLCapableFastMCP(FastMCP):
         from starlette.routing import Route  # pylint: disable=import-outside-toplevel
 
         # First-Party
-        from mcpgateway.utils.orjson_response import ORJSONResponse  # pylint: disable=import-outside-toplevel
+        from mcpgateway.plugins.framework.utils import ORJSONResponse  # pylint: disable=import-outside-toplevel
 
         async def health_check(_request: Request):
             """Health check endpoint for container orchestration.
@@ -300,8 +309,35 @@ class SSLCapableFastMCP(FastMCP):
             """
             return ORJSONResponse({"status": "healthy"})
 
+        async def metrics_endpoint(_request: Request):
+            """Prometheus metrics endpoint.
+
+            Returns:
+                JSON response with health status.
+
+            """
+            metrics_data = generate_latest(REGISTRY)
+            return Response(content=metrics_data, media_type="text/plain; version=0.0.4")
+
+        async def metrics_disabled():
+            """Returns metrics response when metrics collection is disabled.
+
+            Returns:
+                Response: HTTP 503 response indicating metrics are disabled.
+            """
+            return Response(content='{"error": "Metrics collection is disabled"}', media_type="application/json", status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        routes = [
+            Route("/health", health_check, methods=["GET"]),
+        ]
+        enable_metrics = os.getenv("ENABLE_METRICS", "true").lower() == "true"
+        if enable_metrics:
+            routes.append(Route("/metrics/prometheus", metrics_endpoint, methods=["GET"]))
+        else:
+            routes.append(Route("/metrics/prometheus", metrics_disabled, methods=["GET"]))
+
         # Create a minimal Starlette app with only the health endpoint
-        health_app = Starlette(routes=[Route("/health", health_check, methods=["GET"])])
+        health_app = Starlette(routes=routes)
 
         logger.info(f"Starting HTTP health check server on {self.settings.host}:{health_port}")
         config = uvicorn.Config(
@@ -335,7 +371,7 @@ class SSLCapableFastMCP(FastMCP):
         from starlette.routing import Route  # pylint: disable=import-outside-toplevel
 
         # First-Party
-        from mcpgateway.utils.orjson_response import ORJSONResponse  # pylint: disable=import-outside-toplevel
+        from mcpgateway.plugins.framework.utils import ORJSONResponse  # pylint: disable=import-outside-toplevel
 
         async def health_check(_request: Request):
             """Health check endpoint for container orchestration.
@@ -347,6 +383,30 @@ class SSLCapableFastMCP(FastMCP):
 
         # Add the health route to the Starlette app
         starlette_app.routes.append(Route("/health", health_check, methods=["GET"]))
+
+        async def metrics_endpoint(_request: Request):
+            """Prometheus metrics endpoint.
+
+            Returns:
+                text response with metrics detail.
+            """
+            metrics_data = generate_latest(REGISTRY)
+            return Response(content=metrics_data, media_type="text/plain; version=0.0.4")
+
+        async def metrics_disabled():
+            """Returns metrics response when metrics collection is disabled.
+
+            Returns:
+                Response: HTTP 503 response indicating metrics are disabled.
+            """
+            return Response(content='{"error": "Metrics collection is disabled"}', media_type="application/json", status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        # Add the metrics route to the Starlette app
+        enable_metrics = os.getenv("ENABLE_METRICS", "true").lower() == "true"
+        if enable_metrics:
+            starlette_app.routes.append(Route("/metrics/prometheus", metrics_endpoint, methods=["GET"]))
+        else:
+            starlette_app.routes.append(Route("/metrics/prometheus", metrics_disabled, methods=["GET"]))
 
         # Build uvicorn config with optional SSL
         ssl_config = self._get_ssl_config()
@@ -424,7 +484,8 @@ async def run() -> None:
 
     # Determine transport type from environment variable or auto-detect
     # Auto-detect: if stdin is not a TTY (i.e., it's being piped), use stdio mode
-    transport = os.environ.get("PLUGINS_TRANSPORT", None)
+    # First-Party
+    transport = get_transport_settings().transport
     if transport is None:
         # Auto-detect based on stdin
         if not sys.stdin.isatty():
@@ -447,15 +508,18 @@ async def run() -> None:
             mcp.tool(name=GET_PLUGIN_CONFIGS)(get_plugin_configs)
             mcp.tool(name=GET_PLUGIN_CONFIG)(get_plugin_config)
             mcp.tool(name=INVOKE_HOOK)(invoke_hook)
+            # set the plugin_info gauge on startup
+            PLUGIN_INFO.labels(server_name=MCP_SERVER_NAME, transport="stdio", ssl_enabled="false").set(1)
 
             # Run with stdio transport
             logger.info("Starting MCP plugin server with FastMCP (stdio transport)")
             await mcp.run_stdio_async()
 
         else:  # http or streamablehttp
+            server_config: MCPServerConfig = SERVER.get_server_config()
             # Create FastMCP server with SSL support
             mcp = SSLCapableFastMCP(
-                server_config=SERVER.get_server_config(),
+                server_config,
                 name=MCP_SERVER_NAME,
                 instructions=MCP_SERVER_INSTRUCTIONS,
             )
@@ -464,7 +528,11 @@ async def run() -> None:
             mcp.tool(name=GET_PLUGIN_CONFIGS)(get_plugin_configs)
             mcp.tool(name=GET_PLUGIN_CONFIG)(get_plugin_config)
             mcp.tool(name=INVOKE_HOOK)(invoke_hook)
-
+            # set the plugin_info gauge on startup
+            ssl_enabled: Literal["true", "false"] = "true" if server_config and server_config.tls is not None else "false"
+            PLUGIN_INFO.labels(server_name=MCP_SERVER_NAME, transport="http", ssl_enabled=ssl_enabled).set(1)
+            if server_config:
+                logger.info(f"Prometheus metrics available at http://{server_config.host}:{server_config.port}/metrics/prometheus")
             # Run with streamable-http transport
             logger.info("Starting MCP plugin server with FastMCP (HTTP transport)")
             await mcp.run_streamable_http_async()

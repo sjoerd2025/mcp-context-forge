@@ -24,7 +24,7 @@ graph LR
 
     B --> C
 
-    subgraph CF["Context Forge"]
+    subgraph CF["ContextForge"]
         E["gateway"]
         D o--"MCP<br>&nbsp;&nbsp;<small>tools/call <i>hook</i></small>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"--o E
     end
@@ -37,15 +37,15 @@ The process breaks down into these main steps:
 - **Bootstrap**: Start with a plugin template and run the bootstrap command to set up your project structure
 - **Build**: Compile and package your plugin code
 - **Serve**: Launch a local development server to test your plugin
-- **Connect**: Your served plugin automatically integrates with Context Forge's gateway via MCP (Model Context Protocol), using tool calls over standardized hooks for seamless communication
+- **Connect**: Your served plugin automatically integrates with ContextForge's gateway via MCP (Model Context Protocol), using tool calls over standardized hooks for seamless communication
 
-This streamlined approach lets developers focus on building functionality rather than wrestling with configuration, while ensuring plugins work smoothly within the broader Context Forge ecosystem.
+This streamlined approach lets developers focus on building functionality rather than wrestling with configuration, while ensuring plugins work smoothly within the broader ContextForge ecosystem.
 
 ### Bootstrap
 
-Creating a new plugin for Context Forge only takes a few minutes!
+Creating a new plugin for ContextForge only takes a few minutes!
 
-Using the `mcpplugins` tool (installed with Context Forge),
+Using the `mcpplugins` tool (installed with ContextForge),
 
 ```bash
 mcpplugins bootstrap --destination your/plugin/dir
@@ -129,6 +129,105 @@ You can run `mcp inspector` to check your new server (note, it requires `npm`):
 
 ```bash
 npx @modelcontextprotocol/inspector
+```
+
+### Using gRPC Transport
+
+For higher performance, you can use gRPC transport instead of MCP/HTTP. See the [gRPC Transport Guide](./grpc-transport.md) for details on performance comparisons.
+
+#### Local Development with gRPC
+
+```bash
+# Install with gRPC support
+make install-grpc
+
+# Set transport to gRPC in .env
+echo "PLUGINS_TRANSPORT=grpc" >> .env
+
+# Start the server (defaults to port 50051)
+./run-server.sh
+```
+
+#### Container Deployment with gRPC
+
+To deploy your plugin container with gRPC transport:
+
+```bash
+# 1. Build the container with gRPC support
+make build-grpc
+
+# 2. Configure .env for gRPC
+cat >> .env << 'EOF'
+PLUGINS_TRANSPORT=grpc
+PLUGINS_GRPC_SERVER_HOST=0.0.0.0
+PLUGINS_GRPC_SERVER_PORT=50051
+EOF
+
+# 3. Start the container with gRPC port mapping
+make start-grpc
+```
+
+Alternatively, you can manually specify the port:
+
+```bash
+make CONTAINER_PORT=50051 CONTAINER_INTERNAL_PORT=50051 start
+```
+
+#### Enabling mTLS for gRPC
+
+To secure gRPC communication with mutual TLS:
+
+```bash
+# 1. Generate certificates (from the gateway directory)
+make certs-mcp-ca                            # Generate CA
+make certs-mcp-plugin PLUGIN_NAME=MyPlugin   # Generate plugin server cert
+
+# 2. Copy certs to your plugin directory
+mkdir -p certs/grpc
+cp path/to/ca.pem certs/grpc/
+cp path/to/server.pem certs/grpc/
+cp path/to/server-key.pem certs/grpc/
+
+# 3. Configure .env for mTLS
+cat >> .env << 'EOF'
+PLUGINS_TRANSPORT=grpc
+PLUGINS_GRPC_SERVER_HOST=0.0.0.0
+PLUGINS_GRPC_SERVER_PORT=50051
+PLUGINS_GRPC_SERVER_SSL_ENABLED=true
+PLUGINS_GRPC_SERVER_SSL_CERTFILE=certs/grpc/server.pem
+PLUGINS_GRPC_SERVER_SSL_KEYFILE=certs/grpc/server-key.pem
+PLUGINS_GRPC_SERVER_SSL_CA_CERTS=certs/grpc/ca.pem
+PLUGINS_GRPC_SERVER_SSL_CLIENT_AUTH=require
+EOF
+
+# 4. Build and start with mTLS
+make build-grpc
+make start-grpc-tls   # Mounts certs/ into the container
+```
+
+The `start-grpc-tls` target automatically mounts the `certs/` directory into the container at `/opt/app-root/src/certs`.
+
+For detailed TLS/mTLS configuration options, see the [gRPC Transport Guide](./grpc-transport.md#tlsmtls-configuration).
+
+#### Container Deployment with Unix Socket Transport
+
+For local high-performance deployments using Unix domain sockets:
+
+```bash
+# 1. Build the container with gRPC support (required for protobuf)
+make build-grpc
+
+# 2. Configure .env for Unix socket
+cat >> .env << 'EOF'
+PLUGINS_TRANSPORT=unix
+PLUGINS_UNIX_SOCKET_PATH=/var/run/mcp-plugin.sock
+EOF
+
+# 3. Start with socket volume mount
+docker run --name my-plugin \
+    --env-file=.env \
+    -v /var/run:/var/run \
+    my-plugin:latest
 ```
 
 ## Plugin Templates

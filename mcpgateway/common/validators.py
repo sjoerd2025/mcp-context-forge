@@ -4,7 +4,7 @@ Copyright 2025
 SPDX-License-Identifier: Apache-2.0
 Authors: Mihai Criveti, Madhav Kandukuri
 
-SecurityValidator for MCP Gateway
+SecurityValidator for ContextForge
 This module defines the `SecurityValidator` class, which provides centralized, configurable
 validation logic for user-generated content in MCP-based applications.
 
@@ -38,7 +38,7 @@ Example usage:
 Examples:
     >>> from mcpgateway.common.validators import SecurityValidator
     >>> SecurityValidator.sanitize_display_text('<b>Test</b>', 'test')
-    '&lt;b&gt;Test&lt;/b&gt;'
+    'Test'
     >>> SecurityValidator.validate_name('valid_name-123', 'test')
     'valid_name-123'
     >>> SecurityValidator.validate_identifier('my.test.id_123', 'test')
@@ -48,7 +48,7 @@ Examples:
 """
 
 # Standard
-import html
+from html.parser import HTMLParser
 import ipaddress
 import logging
 from pathlib import Path
@@ -76,7 +76,9 @@ logger = logging.getLogger(__name__)
 _HTML_SPECIAL_CHARS_RE: Pattern[str] = re.compile(r'[<>"\']')  # / removed per SEP-986
 _DANGEROUS_TEMPLATE_TAGS_RE: Pattern[str] = re.compile(r"<(script|iframe|object|embed|link|meta|base|form)\b", re.IGNORECASE)
 _EVENT_HANDLER_RE: Pattern[str] = re.compile(r"on\w+\s*=", re.IGNORECASE)
-_MIME_TYPE_RE: Pattern[str] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9!#$&\-\^_+\.]*\/[a-zA-Z0-9][a-zA-Z0-9!#$&\-\^_+\.]*$")
+_MIME_TYPE_RE: Pattern[str] = re.compile(  # noqa: DUO138 - no ReDoS: inner groups require literal ; and = delimiters preventing backtrack ambiguity
+    r'^[a-zA-Z0-9][a-zA-Z0-9!#$&\-\^_+\.]*\/[a-zA-Z0-9][a-zA-Z0-9!#$&\-\^_+\.]*(?:\s*;\s*[a-zA-Z0-9!#$&\-\^_+\.]+=(?:[a-zA-Z0-9!#$&\-\^_+\.]+|"[^"\r\n]*"))*$'
+)
 _URI_SCHEME_RE: Pattern[str] = re.compile(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://")
 _SHELL_DANGEROUS_CHARS_RE: Pattern[str] = re.compile(r"[;&|`$(){}\[\]<>]")
 _ANSI_ESCAPE_RE: Pattern[str] = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
@@ -222,6 +224,68 @@ _SQL_PATTERNS: List[Pattern[str]] = [
 ]
 
 
+# ============================================================================
+# HTML Tag Stripper with Character Preservation
+# ============================================================================
+class _TagStripper(HTMLParser):
+    """Strip HTML tags while preserving all text content and special characters.
+
+    This parser removes HTML tags but keeps the text content exactly as-is,
+    including special characters like &, ", and '. HTML entities are decoded
+    to their literal characters (e.g., & becomes &).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.reset()
+        self.strict = False
+        self.fed: List[str] = []
+
+    def handle_data(self, data: str) -> None:
+        """Handle text data between tags.
+
+        With convert_charrefs=True, HTML entities are automatically decoded
+        (e.g., &amp; → &) and plain text with & passes through unchanged.
+
+        Args:
+            data: Text content between HTML tags
+        """
+        self.fed.append(data)
+
+    def get_data(self) -> str:
+        """Return the accumulated text content.
+
+        Returns:
+            str: Concatenated text content from all handled data
+        """
+        return "".join(self.fed)
+
+
+def _strip_html_tags(value: str) -> str:
+    """Remove HTML tags while preserving special characters exactly as-is.
+
+    Args:
+        value: String that may contain HTML tags
+
+    Returns:
+        String with HTML tags removed but text content preserved
+
+    Examples:
+        >>> _strip_html_tags('<b>Hello</b> World')
+        'Hello World'
+        >>> _strip_html_tags('Test & Check')
+        'Test & Check'
+        >>> _strip_html_tags('Quote: "Hello"')
+        'Quote: "Hello"'
+        >>> _strip_html_tags('&&&')
+        '&&&'
+    """
+    s = _TagStripper()
+    s.feed(value)
+    s.close()
+    return s.get_data()
+
+
 class SecurityValidator:
     """Configurable validation with MCP-compliant limits"""
 
@@ -233,7 +297,7 @@ class SecurityValidator:
     ALLOWED_URL_SCHEMES = settings.validation_allowed_url_schemes  # Default: ["http://", "https://", "ws://", "wss://"]
 
     # Character type patterns
-    NAME_PATTERN = settings.validation_name_pattern  # Default: ^[a-zA-Z0-9_\-\s]+$
+    NAME_PATTERN = settings.validation_name_pattern  # Default: ^[a-zA-Z0-9_.\- ]+$ (literal space, not \s)
     IDENTIFIER_PATTERN = settings.validation_identifier_pattern  # Default: ^[a-zA-Z0-9_\-\.]+$
     VALIDATION_SAFE_URI_PATTERN = settings.validation_safe_uri_pattern  # Default: ^[a-zA-Z0-9_\-.:/?=&%]+$
     VALIDATION_UNSAFE_URI_PATTERN = settings.validation_unsafe_uri_pattern  # Default: [<>"\'\\]
@@ -262,12 +326,12 @@ class SecurityValidator:
             ValueError: When input is not acceptable
 
         Examples:
-            Basic HTML escaping:
+            Basic HTML tag stripping:
 
             >>> SecurityValidator.sanitize_display_text('Hello World', 'test')
             'Hello World'
             >>> SecurityValidator.sanitize_display_text('Hello <b>World</b>', 'test')
-            'Hello &lt;b&gt;World&lt;/b&gt;'
+            'Hello World'
 
             Empty/None handling:
 
@@ -291,7 +355,7 @@ class SecurityValidator:
                 ...
             ValueError: test contains potentially dangerous character sequences
             >>> SecurityValidator.sanitize_display_text('-->test', 'test')
-            '--&gt;test'
+            '-->test'
             >>> SecurityValidator.sanitize_display_text('--><script>', 'test')
             Traceback (most recent call last):
                 ...
@@ -301,14 +365,14 @@ class SecurityValidator:
                 ...
             ValueError: test contains potentially dangerous character sequences
 
-            Safe character escaping:
+            Special characters (preserved as-is, no HTML entity conversion):
 
             >>> SecurityValidator.sanitize_display_text('User & Admin', 'test')
-            'User &amp; Admin'
+            'User & Admin'
             >>> SecurityValidator.sanitize_display_text('Quote: "Hello"', 'test')
-            'Quote: &quot;Hello&quot;'
+            'Quote: "Hello"'
             >>> SecurityValidator.sanitize_display_text("Quote: 'Hello'", 'test')
-            'Quote: &#x27;Hello&#x27;'
+            "Quote: 'Hello'"
         """
         if not value:
             return value
@@ -325,8 +389,8 @@ class SecurityValidator:
             if pattern.search(value):
                 raise ValueError(f"{field_name} contains potentially dangerous character sequences")
 
-        # Escape HTML entities to ensure proper display
-        return html.escape(value, quote=True)
+        cleaned = _strip_html_tags(value)
+        return cleaned
 
     @classmethod
     def validate_name(cls, value: str, field_name: str = "Name") -> str:
@@ -771,19 +835,12 @@ class SecurityValidator:
                 ...
             ValueError: Template contains potentially dangerous expressions
 
-            Length limit testing:
-
-            >>> long_template = 'a' * 65537
-            >>> SecurityValidator.validate_template(long_template)
-            Traceback (most recent call last):
-                ...
-            ValueError: Template exceeds maximum length of 65536
+            Length limit note: size validation is performed at the service layer
+            using configurable limits (ContentSecurityService). This validator
+            only checks encoding, dangerous patterns, and SSTI prevention.
         """
         if not value:
             return value
-
-        if len(value) > cls.MAX_TEMPLATE_LENGTH:
-            raise ValueError(f"Template exceeds maximum length of {cls.MAX_TEMPLATE_LENGTH}")
 
         # Block dangerous tags but allow Jinja2 syntax {{ }} and {% %} (uses precompiled regex)
         if _DANGEROUS_TEMPLATE_TAGS_RE.search(value):
@@ -818,6 +875,75 @@ class SecurityValidator:
             raise ValueError("Template contains potentially dangerous expressions")
 
         return value
+
+    @classmethod
+    def sanitize_log_message(cls, message: Optional[Any], max_length: int = 10000) -> str:
+        """Sanitize log message to prevent log injection attacks.
+
+        Removes newlines, carriage returns, ANSI escapes, and control characters
+        to prevent log forging and injection attacks (CWE-117).
+
+        Args:
+            message: Log message to sanitize
+            max_length: Maximum length (default: 10000)
+
+        Returns:
+            Sanitized message safe for logging
+
+        Examples:
+            Basic newline removal:
+
+            >>> SecurityValidator.sanitize_log_message("User\\nFake: admin")
+            'User Fake: admin'
+            >>> SecurityValidator.sanitize_log_message("Test\\rInjection")
+            'Test Injection'
+
+            ANSI escape removal:
+
+            >>> SecurityValidator.sanitize_log_message("User: \\x1B[31madmin\\x1B[0m")
+            'User: admin'
+
+            Control character removal:
+
+            >>> result = SecurityValidator.sanitize_log_message("User\\x00\\x01\\x02")
+            >>> "\\x00" not in result and "\\x01" not in result
+            True
+
+            Length truncation:
+
+            >>> long_msg = "A" * 15000
+            >>> result = SecurityValidator.sanitize_log_message(long_msg, max_length=10000)
+            >>> len(result) <= 10020
+            True
+            >>> result.endswith("[truncated]")
+            True
+
+            Empty input handling:
+
+            >>> SecurityValidator.sanitize_log_message("")
+            ''
+            >>> SecurityValidator.sanitize_log_message(None)
+            ''
+        """
+        if not message:
+            return ""
+
+        text = str(message)
+
+        # Remove newlines and carriage returns (primary log injection vectors)
+        text = text.replace("\n", " ").replace("\r", " ")
+
+        # Remove ANSI escape sequences
+        text = _ANSI_ESCAPE_RE.sub("", text)
+
+        # Remove control characters
+        text = _CONTROL_CHARS_RE.sub("", text)
+
+        # Truncate to prevent log flooding
+        if len(text) > max_length:
+            text = text[:max_length] + "...[truncated]"
+
+        return text
 
     @classmethod
     def validate_url(cls, value: str, field_name: str = "URL") -> str:
@@ -1023,7 +1149,7 @@ class SecurityValidator:
             raise ValueError(f"{field_name} contains line breaks which are not allowed")
 
         # Check for spaces in domain
-        if " " in value.split("?")[0]:  # Check only in the URL part, not query string
+        if " " in value.split("?", maxsplit=1)[0]:  # Check only in the URL part, not query string
             raise ValueError(f"{field_name} contains spaces which are not allowed in URLs")
 
         # Basic URL structure validation
@@ -1092,6 +1218,7 @@ class SecurityValidator:
             - ssrf_blocked_hosts: Hostnames always blocked
             - ssrf_allow_localhost: If False, blocks 127.0.0.0/8 and localhost
             - ssrf_allow_private_networks: If False, blocks RFC 1918 private ranges
+            - ssrf_allowed_networks: Optional CIDR allowlist for private ranges
 
         Examples:
             Cloud metadata (always blocked):
@@ -1124,6 +1251,7 @@ class SecurityValidator:
 
             >>> mock_settings.ssrf_allow_localhost = True
             >>> mock_settings.ssrf_allow_private_networks = True
+            >>> mock_settings.ssrf_allowed_networks = []
             >>> with patch('mcpgateway.common.validators.settings', mock_settings):
             ...     SecurityValidator._validate_ssrf('8.8.8.8', 'URL')  # Should not raise
         """
@@ -1186,7 +1314,20 @@ class SecurityValidator:
             # Check private networks (if not allowed)
             if not settings.ssrf_allow_private_networks:
                 if ip_addr.is_private and not ip_addr.is_loopback:
-                    raise ValueError(f"{field_name} contains private network address which is blocked by SSRF protection")
+                    allowed_private = False
+                    allowed_networks = getattr(settings, "ssrf_allowed_networks", []) or []
+                    for network_str in allowed_networks:
+                        try:
+                            network = ipaddress.ip_network(network_str, strict=False)
+                        except ValueError:
+                            logger.warning(f"Invalid CIDR in ssrf_allowed_networks: {network_str}")
+                            continue
+                        if ip_addr in network:
+                            allowed_private = True
+                            break
+
+                    if not allowed_private:
+                        raise ValueError(f"{field_name} contains private network address which is blocked by SSRF protection")
 
     @classmethod
     def validate_no_xss(cls, value: str, field_name: str) -> None:
@@ -1399,6 +1540,13 @@ class SecurityValidator:
             >>> SecurityValidator.validate_mime_type('image/svg+xml')
             'image/svg+xml'
 
+            Valid MIME types with parameters:
+
+            >>> SecurityValidator.validate_mime_type('application/json; charset=utf-8')
+            'application/json; charset=utf-8'
+            >>> SecurityValidator.validate_mime_type('text/plain; charset=utf-8')
+            'text/plain; charset=utf-8'
+
             Invalid MIME type formats:
 
             >>> SecurityValidator.validate_mime_type('invalid')
@@ -1443,12 +1591,12 @@ class SecurityValidator:
             ...     'not in the allowed list' in str(e)
             True
 
-            Test MIME type with parameters (line 618):
+            Test MIME type with parameters:
 
             >>> try:
             ...     SecurityValidator.validate_mime_type('application/evil; charset=utf-8')
             ... except ValueError as e:
-            ...     'Invalid MIME type format' in str(e)
+            ...     'not in the allowed list' in str(e)
             True
         """
         if not value:
@@ -1460,9 +1608,9 @@ class SecurityValidator:
 
         # Common safe MIME types
         safe_mime_types = settings.validation_allowed_mime_types
-        if value not in safe_mime_types:
+        base_type = value.split(";", 1)[0].strip()
+        if value not in safe_mime_types and base_type not in safe_mime_types:
             # Allow x- vendor types and + suffixes
-            base_type = value.split(";")[0].strip()
             if not (base_type.startswith("application/x-") or base_type.startswith("text/x-") or "+" in base_type):
                 raise ValueError(f"MIME type '{value}' is not in the allowed list")
 
@@ -1651,3 +1799,19 @@ class SecurityValidator:
         if isinstance(data, list):
             return [cls.sanitize_json_response(item) for item in data]
         return data
+
+
+def validate_core_url(value: str, field_name: str = "URL") -> str:
+    """Core ContextForge URL validation entry point.
+
+    This wrapper provides an explicit core-only entry point so the core
+    processing path does not depend on plugin-framework validators.
+
+    Args:
+        value: The URL string to validate.
+        field_name: Descriptive name for error messages.
+
+    Returns:
+        The validated URL string.
+    """
+    return SecurityValidator.validate_url(value, field_name)
