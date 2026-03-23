@@ -41,8 +41,8 @@ from mcp.client.streamable_http import streamablehttp_client
 import parse
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, not_, or_, select
-from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import joinedload, Session
+from sqlalchemy.exc import IntegrityError, MultipleResultsFound, OperationalError
+from sqlalchemy.orm import joinedload, selectinload, Session
 
 # First-Party
 from mcpgateway.common.models import ResourceContent, ResourceContents, ResourceTemplate, TextContent
@@ -59,6 +59,7 @@ from mcpgateway.observability import create_span
 from mcpgateway.schemas import ResourceCreate, ResourceMetrics, ResourceRead, ResourceSubscription, ResourceUpdate, TopPerformer
 from mcpgateway.services.audit_trail_service import get_audit_trail_service
 from mcpgateway.services.base_service import BaseService
+from mcpgateway.services.content_security import ContentSizeError, get_content_security_service
 from mcpgateway.services.event_service import EventService
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.mcp_session_pool import get_mcp_session_pool, TransportType
@@ -279,7 +280,10 @@ class ResourceService(BaseService):
             >>> m2 = SimpleNamespace(is_success=False, response_time=0.3, timestamp=now)
             >>> r = SimpleNamespace(
             ...     id="ca627760127d409080fdefc309147e08", uri='res://x', name='R', description=None, mime_type='text/plain', size=123,
-            ...     created_at=now, updated_at=now, enabled=True, tags=[{"id": "t", "label": "T"}], metrics=[m1, m2]
+            ...     created_at=now, updated_at=now, enabled=True, tags=[{"id": "t", "label": "T"}], metrics=[m1, m2],
+            ...     metrics_summary={"total_executions": 2, "successful_executions": 1, "failed_executions": 1,
+            ...                      "failure_rate": 0.5, "min_response_time": 0.1, "max_response_time": 0.3,
+            ...                      "avg_response_time": 0.2, "last_execution_time": now}
             ... )
             >>> out = svc.convert_resource_to_read(r, include_metrics=True)
             >>> out.metrics.total_executions
@@ -306,24 +310,17 @@ class ResourceService(BaseService):
 
         # Compute aggregated metrics from the resource's metrics list (only if requested)
         if include_metrics:
-            total = len(resource.metrics) if hasattr(resource, "metrics") and resource.metrics is not None else 0
-            successful = sum(1 for m in resource.metrics if m.is_success) if total > 0 else 0
-            failed = sum(1 for m in resource.metrics if not m.is_success) if total > 0 else 0
-            failure_rate = (failed / total) if total > 0 else 0.0
-            min_rt = min((m.response_time for m in resource.metrics), default=None) if total > 0 else None
-            max_rt = max((m.response_time for m in resource.metrics), default=None) if total > 0 else None
-            avg_rt = (sum(m.response_time for m in resource.metrics) / total) if total > 0 else None
-            last_time = max((m.timestamp for m in resource.metrics), default=None) if total > 0 else None
-
+            # Use metrics_summary which combines raw + hourly rollup data (matches tool_service pattern)
+            metrics = resource.metrics_summary
             resource_dict["metrics"] = {
-                "total_executions": total,
-                "successful_executions": successful,
-                "failed_executions": failed,
-                "failure_rate": failure_rate,
-                "min_response_time": min_rt,
-                "max_response_time": max_rt,
-                "avg_response_time": avg_rt,
-                "last_execution_time": last_time,
+                "total_executions": metrics["total_executions"],
+                "successful_executions": metrics["successful_executions"],
+                "failed_executions": metrics["failed_executions"],
+                "failure_rate": metrics["failure_rate"],
+                "min_response_time": metrics["min_response_time"],
+                "max_response_time": metrics["max_response_time"],
+                "avg_response_time": metrics["avg_response_time"],
+                "last_execution_time": metrics["last_execution_time"],
             }
         else:
             resource_dict["metrics"] = None
@@ -405,6 +402,7 @@ class ResourceService(BaseService):
             IntegrityError: If a database integrity error occurs.
             ResourceURIConflictError: If a resource with the same URI already exists.
             ResourceError: For other resource registration errors
+            ContentSizeError: For content size exceed
 
         Examples:
             >>> from mcpgateway.services.resource_service import ResourceService
@@ -426,6 +424,22 @@ class ResourceService(BaseService):
         """
         try:
             logger.info(f"Registering resource: {resource.uri}")
+
+            # Validate content size BEFORE any database operations
+            content_security = get_content_security_service()
+            content_to_validate = ""
+
+            # Extract content from resource for validation
+            # Use raw bytes for accurate size measurement to prevent bypass via non-UTF-8 content
+            if hasattr(resource, "content") and resource.content:
+                if isinstance(resource.content, bytes):
+                    # Validate using raw bytes to get accurate size
+                    content_to_validate = resource.content
+                else:
+                    # Convert string to bytes for consistent size measurement
+                    content_to_validate = str(resource.content)
+
+            content_security.validate_resource_size(content=content_to_validate, uri=resource.uri, user_email=created_by, ip_address=created_from_ip)
 
             # Extract gateway_id from resource if present
             gateway_id = getattr(resource, "gateway_id", None)
@@ -475,7 +489,7 @@ class ResourceService(BaseService):
                 team_id=getattr(resource, "team_id", None) or team_id,
                 owner_email=getattr(resource, "owner_email", None) or owner_email or created_by,
                 # Endpoint visibility parameter takes precedence over schema default
-                visibility=visibility if visibility is not None else getattr(resource, "visibility", "public"),
+                visibility=visibility if visibility is not None else (getattr(resource, "visibility", None) or "public"),
                 gateway_id=gateway_id,
             )
 
@@ -568,6 +582,21 @@ class ResourceService(BaseService):
                 },
             )
             raise rce
+        except ContentSizeError as cse:
+            db.rollback()
+            structured_logger.log(
+                level="ERROR",
+                message=f"Resource content size limit exceeded: {cse.actual_size} bytes (max: {cse.max_size} bytes)",
+                event_type="resource_size_exceed",
+                component="resource_service",
+                user_id=created_by,
+                user_email=owner_email,
+                custom_fields={
+                    "resource_uri": resource.uri,
+                    "visibility": visibility,
+                },
+            )
+            raise cse
         except Exception as e:
             db.rollback()
 
@@ -681,6 +710,16 @@ class ResourceService(BaseService):
 
                 for resource in chunk:
                     try:
+                        # Validate content size before processing
+                        if hasattr(resource, "content") and resource.content:
+                            content_security = get_content_security_service()
+                            content_security.validate_resource_size(
+                                content=resource.content,
+                                uri=resource.uri,
+                                user_email=created_by,
+                                ip_address=created_from_ip,
+                            )
+
                         # Use provided parameters or schema values
                         resource_team_id = team_id if team_id is not None else getattr(resource, "team_id", None)
                         resource_owner_email = owner_email or getattr(resource, "owner_email", None) or created_by
@@ -973,7 +1012,7 @@ class ResourceService(BaseService):
             >>> db2 = MagicMock()
             >>> bind = MagicMock()
             >>> bind.dialect = MagicMock()
-            >>> bind.dialect.name = "sqlite"           # or "postgresql" / "mysql"
+            >>> bind.dialect.name = "sqlite"           # or "postgresql"
             >>> db2.get_bind.return_value = bind
             >>> db2.execute.return_value.scalars.return_value.all.return_value = [MagicMock()]
             >>> result2, _ = asyncio.run(service.list_resources(db2, tags=['api']))
@@ -988,7 +1027,7 @@ class ResourceService(BaseService):
         # This prevents cache poisoning where admin results could leak to public-only requests
         cache = _get_registry_cache()
         if cursor is None and user_email is None and token_teams is None and page is None:
-            filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None, limit=limit)
+            filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None, limit=limit, visibility=visibility)
             cached = await cache.get("resources", filters_hash)
             if cached is not None:
                 # Reconstruct ResourceRead objects from cached dicts
@@ -1199,6 +1238,7 @@ class ResourceService(BaseService):
         db: Session,
         server_id: str,
         include_inactive: bool = False,
+        include_metrics: bool = False,
         user_email: Optional[str] = None,
         token_teams: Optional[List[str]] = None,
     ) -> List[ResourceRead]:
@@ -1214,6 +1254,8 @@ class ResourceService(BaseService):
             db (Session): The SQLAlchemy database session.
             server_id (str): Server ID
             include_inactive (bool): If True, include inactive resources in the result.
+                Defaults to False.
+            include_metrics (bool): If True, include metrics data in the result.
                 Defaults to False.
             user_email (Optional[str]): User email for visibility filtering. If None, no filtering applied.
             token_teams (Optional[List[str]]): Override DB team lookup with token's teams. Used for MCP/API
@@ -1246,6 +1288,10 @@ class ResourceService(BaseService):
             .where(DbResource.uri_template.is_(None))
             .where(server_resource_association.c.server_id == server_id)
         )
+
+        # Eager load metrics relationships to prevent N+1 queries when include_metrics=true
+        if include_metrics:
+            query = query.options(selectinload(DbResource.metrics), selectinload(DbResource.metrics_hourly))
         if not include_inactive:
             query = query.where(DbResource.enabled)
 
@@ -1295,7 +1341,7 @@ class ResourceService(BaseService):
         for t in resources:
             try:
                 t.team = team_map.get(str(t.team_id)) if t.team_id else None
-                result.append(self.convert_resource_to_read(t, include_metrics=False))
+                result.append(self.convert_resource_to_read(t, include_metrics=include_metrics))
             except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
                 logger.exception(f"Failed to convert resource {getattr(t, 'id', 'unknown')} ({getattr(t, 'name', 'unknown')}): {e}")
                 # Continue with remaining resources instead of failing completely
@@ -2121,10 +2167,27 @@ class ResourceService(BaseService):
                     # Matches uri (modified value from pluggins if applicable)
                     # with uri from resource DB
                     # if uri is of type resource template then resource is retreived from DB
-                    query = select(DbResource).where(DbResource.uri == str(uri)).where(DbResource.enabled)
+                    query = select(DbResource)
+                    if server_id:
+                        query = query.join(
+                            server_resource_association,
+                            server_resource_association.c.resource_id == DbResource.id,
+                        ).where(server_resource_association.c.server_id == server_id)
+                    query = query.where(DbResource.uri == str(uri)).where(DbResource.enabled)
                     if include_inactive:
-                        query = select(DbResource).where(DbResource.uri == str(uri))
-                    resource_db = db.execute(query).scalar_one_or_none()
+                        query = select(DbResource)
+                        if server_id:
+                            query = query.join(
+                                server_resource_association,
+                                server_resource_association.c.resource_id == DbResource.id,
+                            ).where(server_resource_association.c.server_id == server_id)
+                        query = query.where(DbResource.uri == str(uri))
+                    try:
+                        resource_db = db.execute(query).scalar_one_or_none()
+                    except MultipleResultsFound as exc:
+                        if server_id:
+                            raise ResourceError(f"Multiple resources matched URI '{uri}' for server '{server_id}'.") from exc
+                        raise ResourceError(f"Resource URI '{uri}' is ambiguous across multiple servers; use /servers/{{id}}/mcp.") from exc
 
                     # Check for direct_proxy mode
                     if resource_db and resource_db.gateway and getattr(resource_db.gateway, "gateway_mode", "cache") == "direct_proxy" and settings.mcpgateway_direct_proxy_enabled:
@@ -2167,7 +2230,9 @@ class ResourceService(BaseService):
                                         content = TextResourceContents(uri=uri, text="")
 
                                     success = True
-                                    logger.info(f"[READ RESOURCE] Using direct_proxy mode for gateway {gateway.id} (from X-Context-Forge-Gateway-Id header). Meta Attached: {meta_data is not None}")
+                                    logger.info(
+                                        f"[READ RESOURCE] Using direct_proxy mode for gateway {SecurityValidator.sanitize_log_message(gateway.id)} (from X-Context-Forge-Gateway-Id header). Meta Attached: {meta_data is not None}"
+                                    )
                                     # Skip the rest of the DB lookup logic
 
                         except Exception as e:
@@ -2178,8 +2243,23 @@ class ResourceService(BaseService):
                         # Normal cache mode - resource found in DB
                         content = resource_db.content
                     else:
-                        # Check the inactivity first
-                        check_inactivity = db.execute(select(DbResource).where(DbResource.uri == str(resource_uri)).where(not_(DbResource.enabled))).scalar_one_or_none()
+                        # Check the inactivity first using the same server scope that
+                        # governed the active lookup. Without this, duplicate URIs
+                        # across different virtual servers/gateways can produce
+                        # ambiguous results even though the current request is
+                        # already scoped to a single server.
+                        inactive_query = select(DbResource)
+                        if server_id:
+                            inactive_query = inactive_query.join(
+                                server_resource_association,
+                                server_resource_association.c.resource_id == DbResource.id,
+                            ).where(server_resource_association.c.server_id == server_id)
+                        try:
+                            check_inactivity = db.execute(inactive_query.where(DbResource.uri == str(resource_uri)).where(not_(DbResource.enabled))).scalar_one_or_none()
+                        except MultipleResultsFound as exc:
+                            if server_id:
+                                raise ResourceError(f"Multiple inactive resources matched URI '{resource_uri}' for server '{server_id}'.") from exc
+                            raise ResourceError(f"Resource URI '{resource_uri}' is ambiguous across multiple servers; use /servers/{{id}}/mcp.") from exc
                         if check_inactivity:
                             raise ResourceNotFoundError(f"Resource '{resource_uri}' exists but is inactive")
 
@@ -2662,6 +2742,7 @@ class ResourceService(BaseService):
             ResourceError: For other update errors
             IntegrityError: If a database integrity error occurs.
             Exception: For unexpected errors
+            ContentSizeError: For content size exceed
 
         Example:
             >>> from mcpgateway.services.resource_service import ResourceService
@@ -2728,6 +2809,15 @@ class ResourceService(BaseService):
 
             # Update content if provided
             if resource_update.content is not None:
+                # Validate content size before updating
+                content_security = get_content_security_service()
+                content_security.validate_resource_size(
+                    content=resource_update.content,
+                    uri=resource_update.uri or resource.uri,
+                    user_email=modified_by or user_email,
+                    ip_address=modified_from_ip,
+                )
+
                 # Determine content storage
                 is_text = resource.mime_type and resource.mime_type.startswith("text/") or isinstance(resource_update.content, str)
 
@@ -2858,6 +2948,20 @@ class ResourceService(BaseService):
                 error=ie,
             )
             raise ie
+        except ContentSizeError as cse:
+            db.rollback()
+            structured_logger.log(
+                level="ERROR",
+                message=f"Resource content size limit exceeded: {cse.actual_size} bytes (max: {cse.max_size} bytes)",
+                event_type="resource_content_size_exceed",
+                component="resource_service",
+                resource_type="resource",
+                user_id=modified_by,
+                user_email=user_email,
+                resource_id=str(resource_id),
+                error=cse,
+            )
+            raise cse
         except ResourceURIConflictError as pe:
             logger.error(f"Resource URI conflict: {pe}")
 

@@ -49,6 +49,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 import httpx
+import jwt
 import orjson
 from pydantic import SecretStr, ValidationError
 from pydantic_core import ValidationError as CoreValidationError
@@ -124,6 +125,7 @@ from mcpgateway.services.a2a_service import A2AAgentError, A2AAgentNameConflictE
 from mcpgateway.services.argon2_service import Argon2PasswordService
 from mcpgateway.services.audit_trail_service import get_audit_trail_service
 from mcpgateway.services.catalog_service import catalog_service
+from mcpgateway.services.content_security import ContentSizeError
 from mcpgateway.services.email_auth_service import AuthenticationError, EmailAuthService, PasswordValidationError
 from mcpgateway.services.encryption_service import get_encryption_service
 from mcpgateway.services.export_service import ExportError, ExportService
@@ -137,7 +139,7 @@ from mcpgateway.services.oauth_manager import OAuthManager
 from mcpgateway.services.performance_service import get_performance_service
 from mcpgateway.services.permission_service import PermissionService
 from mcpgateway.services.plugin_service import get_plugin_service
-from mcpgateway.services.prompt_service import PromptNameConflictError, PromptNotFoundError, PromptService
+from mcpgateway.services.prompt_service import PromptArgumentsJSONError, PromptNameConflictError, PromptNotFoundError, PromptService
 from mcpgateway.services.resource_service import ResourceNotFoundError, ResourceService, ResourceURIConflictError
 from mcpgateway.services.root_service import RootService, RootServiceError, RootServiceNotFoundError
 from mcpgateway.services.server_service import ServerError, ServerLockConflictError, ServerNameConflictError, ServerNotFoundError, ServerService
@@ -1382,6 +1384,42 @@ def _owner_access_condition(owner_column, team_column, *, user_email: str, team_
     return owner_column == user_email
 
 
+def _merge_select_all_ids(form: Any, flag_key: str, all_ids_key: str, checked_list: list[str]) -> list[str]:
+    """Merge server-fetched IDs with UI-checked IDs when "Select All" is active.
+
+    When the user clicks "Select All" in a paginated list, the browser populates
+    *all_ids_key* with IDs fetched from the corresponding /ids endpoint. Because
+    that endpoint may be team-scoped, it can miss platform-public items that are
+    still visible (and checked) in the UI. Taking the union of both sources
+    ensures every explicitly selected item is preserved.
+
+    Note: both sources are client-supplied form values. Downstream persistence
+    code is responsible for enforcing final access control on the merged IDs.
+
+    Args:
+        form: Starlette form object.
+        flag_key (str): Form field that signals "Select All" mode (e.g. ``"selectAllTools"``).
+        all_ids_key (str): Form field holding the JSON-encoded server-fetched IDs.
+        checked_list (list[str]): IDs collected from checked checkboxes in the form.
+
+    Returns:
+        list[str]: Merged, deduplicated list of string IDs; or *checked_list* unchanged
+        when Select All is not active or the JSON payload cannot be parsed.
+    """
+    if form.get(flag_key) != "true":
+        return checked_list
+    raw = form.get(all_ids_key) or "[]"
+    try:
+        server_ids = orjson.loads(raw)
+        # Normalise to str to avoid silent int/str duplicates from different sources.
+        merged = list({str(i) for i in server_ids} | set(checked_list))
+        LOGGER.info("Select All (%s): %d items after merge", all_ids_key, len(merged))
+        return merged
+    except orjson.JSONDecodeError:
+        LOGGER.warning("Failed to parse %s JSON, falling back to checked items", all_ids_key)
+        return checked_list
+
+
 async def _has_permission(
     *,
     db: Session,
@@ -1734,6 +1772,7 @@ async def get_overview_partial(
             "redis_available": redis_available,
             "redis_reachable": redis_reachable,
             "uptime_seconds": uptime_seconds,
+            "mcp_runtime": version_module.mcp_runtime_status_payload(),
         }
 
         return request.app.state.templates.TemplateResponse(request, "overview_partial.html", context)
@@ -2250,7 +2289,7 @@ async def admin_servers_partial_html(
     per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     q: str = Query("", description="Search query"),
     tags: Optional[str] = Query(None, description="Tag filter expression (comma=OR, plus=AND)"),
-    include_inactive: bool = False,
+    include_inactive: bool = True,
     render: Optional[str] = Query(None),
     team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
@@ -2470,7 +2509,7 @@ async def admin_get_server(server_id: str, db: Session = Depends(get_db), user=D
     try:
         LOGGER.debug(f"User {get_user_email(user)} requested details for server ID {server_id}")
         server = await server_service.get_server(db, server_id)
-        return server.model_dump(by_alias=True)
+        return server.masked().model_dump(by_alias=True)
     except ServerNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -2530,39 +2569,13 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
     try:
         LOGGER.debug(f"User {get_user_email(user)} is adding a new server with name: {form['name']}")
 
-        # Handle "Select All" for tools
-        associated_tools_list = form.getlist("associatedTools")
-        if form.get("selectAllTools") == "true":
-            # User clicked "Select All" - get all tool IDs from hidden field
-            all_tool_ids_json = str(form.get("allToolIds", "[]"))
-            try:
-                all_tool_ids = orjson.loads(all_tool_ids_json)
-                associated_tools_list = all_tool_ids
-                LOGGER.info(f"Select All tools enabled: {len(all_tool_ids)} tools selected")
-            except orjson.JSONDecodeError:
-                LOGGER.warning("Failed to parse allToolIds JSON, falling back to checked tools")
-
-        # Handle "Select All" for resources
-        associated_resources_list = form.getlist("associatedResources")
-        if form.get("selectAllResources") == "true":
-            all_resource_ids_json = str(form.get("allResourceIds", "[]"))
-            try:
-                all_resource_ids = orjson.loads(all_resource_ids_json)
-                associated_resources_list = all_resource_ids
-                LOGGER.info(f"Select All resources enabled: {len(all_resource_ids)} resources selected")
-            except orjson.JSONDecodeError:
-                LOGGER.warning("Failed to parse allResourceIds JSON, falling back to checked resources")
-
-        # Handle "Select All" for prompts
-        associated_prompts_list = form.getlist("associatedPrompts")
-        if form.get("selectAllPrompts") == "true":
-            all_prompt_ids_json = str(form.get("allPromptIds", "[]"))
-            try:
-                all_prompt_ids = orjson.loads(all_prompt_ids_json)
-                associated_prompts_list = all_prompt_ids
-                LOGGER.info(f"Select All prompts enabled: {len(all_prompt_ids)} prompts selected")
-            except orjson.JSONDecodeError:
-                LOGGER.warning("Failed to parse allPromptIds JSON, falling back to checked prompts")
+        # Handle "Select All" for tools, resources, and prompts.
+        # _merge_select_all_ids takes the union of the server-fetched paginated IDs
+        # (allToolIds etc.) with the explicitly checked form values so that
+        # platform-public items visible in the UI are never silently dropped.
+        associated_tools_list = _merge_select_all_ids(form, "selectAllTools", "allToolIds", form.getlist("associatedTools"))
+        associated_resources_list = _merge_select_all_ids(form, "selectAllResources", "allResourceIds", form.getlist("associatedResources"))
+        associated_prompts_list = _merge_select_all_ids(form, "selectAllPrompts", "allPromptIds", form.getlist("associatedPrompts"))
 
         # Handle OAuth 2.0 configuration (RFC 9728)
         oauth_enabled = form.get("oauth_enabled") == "on"
@@ -2708,39 +2721,13 @@ async def admin_edit_server(
 
         mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)
 
-        # Handle "Select All" for tools
-        associated_tools_list = form.getlist("associatedTools")
-        if form.get("selectAllTools") == "true":
-            # User clicked "Select All" - get all tool IDs from hidden field
-            all_tool_ids_json = str(form.get("allToolIds", "[]"))
-            try:
-                all_tool_ids = orjson.loads(all_tool_ids_json)
-                associated_tools_list = all_tool_ids
-                LOGGER.info(f"Select All tools enabled for edit: {len(all_tool_ids)} tools selected")
-            except orjson.JSONDecodeError:
-                LOGGER.warning("Failed to parse allToolIds JSON, falling back to checked tools")
-
-        # Handle "Select All" for resources
-        associated_resources_list = form.getlist("associatedResources")
-        if form.get("selectAllResources") == "true":
-            all_resource_ids_json = str(form.get("allResourceIds", "[]"))
-            try:
-                all_resource_ids = orjson.loads(all_resource_ids_json)
-                associated_resources_list = all_resource_ids
-                LOGGER.info(f"Select All resources enabled for edit: {len(all_resource_ids)} resources selected")
-            except orjson.JSONDecodeError:
-                LOGGER.warning("Failed to parse allResourceIds JSON, falling back to checked resources")
-
-        # Handle "Select All" for prompts
-        associated_prompts_list = form.getlist("associatedPrompts")
-        if form.get("selectAllPrompts") == "true":
-            all_prompt_ids_json = str(form.get("allPromptIds", "[]"))
-            try:
-                all_prompt_ids = orjson.loads(all_prompt_ids_json)
-                associated_prompts_list = all_prompt_ids
-                LOGGER.info(f"Select All prompts enabled for edit: {len(all_prompt_ids)} prompts selected")
-            except orjson.JSONDecodeError:
-                LOGGER.warning("Failed to parse allPromptIds JSON, falling back to checked prompts")
+        # Handle "Select All" for tools, resources, and prompts.
+        # _merge_select_all_ids takes the union of the server-fetched paginated IDs
+        # (allToolIds etc.) with the explicitly checked form values so that
+        # platform-public items visible in the UI are never silently dropped.
+        associated_tools_list = _merge_select_all_ids(form, "selectAllTools", "allToolIds", form.getlist("associatedTools"))
+        associated_resources_list = _merge_select_all_ids(form, "selectAllResources", "allResourceIds", form.getlist("associatedResources"))
+        associated_prompts_list = _merge_select_all_ids(form, "selectAllPrompts", "allPromptIds", form.getlist("associatedPrompts"))
 
         # Handle OAuth 2.0 configuration (RFC 9728)
         oauth_enabled = form.get("oauth_enabled") == "on"
@@ -3732,6 +3719,7 @@ async def admin_login_page(request: Request) -> Response:
 
     This endpoint serves the login form for email-based authentication.
     If email auth is disabled, redirects to the main admin page.
+    If user is already authenticated, redirects to the dashboard.
 
     Args:
         request (Request): FastAPI request object.
@@ -3765,6 +3753,25 @@ async def admin_login_page(request: Request) -> Response:
         return RedirectResponse(url=f"{root_path}/admin", status_code=303)
 
     root_path = settings.app_root_path
+
+    # Check if user is already authenticated via JWT cookie
+    # Skip redirect when an error param is present — the user was sent here
+    # intentionally (e.g. admin_required, account_disabled).
+    if not request.query_params.get("error"):
+        jwt_token = request.cookies.get("jwt_token") or request.cookies.get("access_token")
+        if jwt_token:
+            try:
+                payload = await verify_jwt_token_cached(jwt_token, request)
+                if payload:
+                    # Only redirect if the token indicates admin privileges;
+                    # otherwise the middleware will reject and redirect back here,
+                    # creating an infinite redirect loop.
+                    is_admin = payload.get("is_admin", False) or payload.get("user", {}).get("is_admin", False)
+                    if is_admin:
+                        return RedirectResponse(url=f"{root_path}/admin", status_code=303)
+            except (HTTPException, jwt.PyJWTError):
+                # Token is invalid or expired, continue to show login page
+                pass
 
     # Only show secure cookie warning if there's a login error AND problematic config
     secure_cookie_warning = None
@@ -4692,10 +4699,20 @@ async def _generate_unified_teams_view(team_service, current_user, root_path):  
                 </div>
                 """
             else:
-                # Show "Request to Join" button
-                actions_html = f"""
+                # Show "Request to Join" button (disabled if feature is disabled)
+                allow_join_requests = getattr(settings, "allow_team_join_requests", True)
+                if allow_join_requests:
+                    actions_html = f"""
                 <div class="flex flex-wrap gap-2 mt-3">
                     <button data-team-id="{team.id}" data-team-name="{safe_team_name}" onclick="requestToJoinTeamSafe(this)" class="px-3 py-1 text-sm font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 border border-indigo-300 dark:border-indigo-600 hover:border-indigo-500 dark:hover:border-indigo-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                        Request to Join
+                    </button>
+                </div>
+                """
+                else:
+                    actions_html = """
+                <div class="flex flex-wrap gap-2 mt-3">
+                    <button disabled class="px-3 py-1 text-sm font-medium text-gray-400 dark:text-gray-600 border border-gray-300 dark:border-gray-600 rounded-md cursor-not-allowed opacity-50" title="Team join requests are currently disabled">
                         Request to Join
                     </button>
                 </div>
@@ -4805,7 +4822,7 @@ async def admin_get_all_team_ids(
 async def admin_search_teams(
     q: str = Query("", description="Search query"),
     include_inactive: bool = False,
-    limit: int = Query(settings.pagination_default_page_size, ge=1, le=100, description="Max results"),
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Max results"),
     visibility: Optional[str] = Query(None, description="Filter by visibility"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -4877,7 +4894,7 @@ async def admin_search_teams(
 async def admin_teams_partial_html(
     request: Request,
     page: int = Query(1, ge=1, description="Page number"),
-    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=100, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = Query(False, description="Include inactive teams"),
     visibility: Optional[str] = Query(None, description="Filter by visibility"),
     render: Optional[str] = Query(None, description="Render mode: 'controls' for pagination controls only"),
@@ -5097,7 +5114,7 @@ async def admin_teams_partial_html(
 async def admin_list_teams(
     request: Request,
     page: int = Query(1, ge=1, description="Page number"),
-    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=100, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     q: Optional[str] = Query(None, description="Search query"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -5248,7 +5265,9 @@ async def admin_create_team(
         user_email = get_user_email(user)
 
         is_admin = isinstance(user, dict) and user.get("is_admin")
-        await team_service.create_team(name=team_data.name, description=team_data.description, created_by=user_email, visibility=team_data.visibility, max_members=team_data.max_members, skip_limits=bool(is_admin))
+        await team_service.create_team(
+            name=team_data.name, description=team_data.description, created_by=user_email, visibility=team_data.visibility, max_members=team_data.max_members, skip_limits=bool(is_admin)
+        )
 
         response = HTMLResponse(content="", status_code=201)
         response.headers["HX-Trigger"] = orjson.dumps({"adminTeamAction": {"refreshUnifiedTeamsList": True, "delayMs": 1000}}).decode()
@@ -5376,22 +5395,18 @@ async def admin_view_team_members(
                       hx-swap="innerHTML"
                       class="px-6 py-4">
 
-                    <!-- Search box -->
-                    <div class="mb-4">
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Search Users</label>
-                        <input
-                            type="text"
-                            id="user-search-{team.id}"
-                            data-team-id="{team.id}"
-                            placeholder="Search by name or email..."
-                            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white"
-                            oninput="debouncedServerSideUserSearch('{team.id}', this.value)"
-                        />
-                    </div>
-
                     <!-- Current Members Section -->
                     <div class="mb-6">
-                        <h5 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Current Members</h5>
+                        <div class="flex items-center justify-between mb-2">
+                            <h5 class="text-sm font-medium text-gray-700 dark:text-gray-300">Current Members</h5>
+                            <input
+                                type="text"
+                                id="member-search-{team.id}"
+                                placeholder="Search members..."
+                                class="w-48 px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white"
+                                oninput="debouncedMemberSearch('{team.id}', this.value)"
+                            />
+                        </div>
                         <div
                             id="team-members-container-{team.id}"
                             class="border border-gray-300 dark:border-gray-600 rounded-md p-3 max-h-64 overflow-y-auto dark:bg-gray-700"
@@ -5405,19 +5420,24 @@ async def admin_view_team_members(
                         </div>
                     </div>
 
-                    <!-- Users to Add Section -->
+                    <!-- Add Users Section -->
                     <div class="mb-4">
-                        <h5 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Users to Add</h5>
+                        <div class="flex items-center justify-between mb-2">
+                            <h5 class="text-sm font-medium text-gray-700 dark:text-gray-300">Add Users</h5>
+                            <input
+                                type="text"
+                                id="non-member-search-{team.id}"
+                                placeholder="Search users by name or email..."
+                                class="w-64 px-2 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white"
+                                oninput="debouncedNonMemberSearch('{team.id}', this.value)"
+                            />
+                        </div>
                         <div
                             id="team-non-members-container-{team.id}"
                             class="border border-gray-300 dark:border-gray-600 rounded-md p-3 max-h-64 overflow-y-auto dark:bg-gray-700"
-                            data-per-page="{per_page}"
-                            hx-get="{root_path}/admin/teams/{team.id}/non-members/partial?page=1&per_page={per_page}"
-                            hx-trigger="load delay:200ms"
-                            hx-target="this"
-                            hx-swap="innerHTML"
+                            data-per-page="50"
                         >
-                            <!-- Non-members will be loaded here via HTMX -->
+                            <div class="text-center py-4 text-gray-500 dark:text-gray-400">Search for users by name or email to add them to this team.</div>
                         </div>
                     </div>
 
@@ -5630,24 +5650,24 @@ async def admin_get_team_edit(
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Name</label>
                     <input type="text" name="name" value="{safe_team_name}" required
-                           class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Letters, numbers, spaces, underscores, periods, and dashes only</p>
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Slug</label>
                     <input type="text" name="slug" value="{team.slug}" readonly
-                           class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-white">
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-white">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Slug cannot be changed</p>
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Description</label>
                     <textarea name="description" rows="3"
-                              class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">{safe_description}</textarea>
+                              class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">{safe_description}</textarea>
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Visibility</label>
                     <select name="visibility"
-                            class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                            class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
                         <option value="private" {"selected" if team.visibility == "private" else ""}>Private</option>
                         <option value="public" {"selected" if team.visibility == "public" else ""}>Public</option>
                     </select>
@@ -5655,7 +5675,7 @@ async def admin_get_team_edit(
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Maximum Members</label>
                     <input type="number" name="max_members" min="1" max="1000" value="{team.max_members if team.max_members else ''}"
-                           class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Leave empty to keep current value</p>
                 </div>
                 <div class="flex justify-end space-x-3">
@@ -5774,7 +5794,8 @@ async def admin_update_team(
 
         # Update team
         user_email = getattr(user, "email", None) or str(user)
-        updated = await team_service.update_team(team_id=team_id, name=name, description=description, visibility=visibility, max_members=max_members, updated_by=user_email)
+        is_admin = isinstance(user, dict) and user.get("is_admin")
+        updated = await team_service.update_team(team_id=team_id, name=name, description=description, visibility=visibility, max_members=max_members, updated_by=user_email, skip_limits=bool(is_admin))
 
         if not updated:
             is_htmx = request.headers.get("HX-Request") == "true"
@@ -5803,7 +5824,20 @@ async def admin_update_team(
         # For regular form submission, redirect to admin page with teams section
         return RedirectResponse(url=f"{root_path}/admin/#teams", status_code=303)
 
+    except ValueError as e:
+        # Rollback to discard any partial mutations (e.g. name/description set before max_members check failed)
+        db.rollback()
+        LOGGER.warning(f"Validation error updating team {team_id}: {e}")
+        is_htmx = request.headers.get("HX-Request") == "true"
+        if is_htmx:
+            response = HTMLResponse(content=f'<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md mb-4">{html.escape(str(e))}</div>', status_code=400)
+            response.headers["HX-Retarget"] = "#edit-team-error"
+            response.headers["HX-Reswap"] = "innerHTML"
+            return response
+        error_msg = urllib.parse.quote(str(e))
+        return RedirectResponse(url=f"{root_path}/admin/?error={error_msg}#teams", status_code=303)
     except Exception as e:
+        db.rollback()
         LOGGER.error(f"Error updating team {team_id}: {e}")
 
         # Check if this is an HTMX request for error handling too
@@ -6397,6 +6431,10 @@ async def admin_create_join_request(
             status_code=201,
         )
 
+    except ValueError as e:
+        # Handle validation errors with user-friendly HTML error
+        error_msg = html.escape(str(e))
+        return HTMLResponse(content=f'<div class="text-red-500">{error_msg}</div>', status_code=400)
     except Exception as e:
         LOGGER.error(f"Error creating join request for team {team_id}: {e}")
         return HTMLResponse(content=f'<div class="text-red-500">Error creating join request: {html.escape(str(e))}</div>', status_code=400)
@@ -6434,15 +6472,26 @@ async def admin_cancel_join_request(
             return HTMLResponse(content='<div class="text-red-500">Failed to cancel join request</div>', status_code=400)
 
         # Return the "Request to Join" button with HX-Trigger for list refresh
-        response = HTMLResponse(
-            content=f"""
+        # Check if join requests are currently enabled
+        allow_join_requests = getattr(settings, "allow_team_join_requests", True)
+
+        if allow_join_requests:
+            button_html = f"""
         <button data-team-id="{team_id}" data-team-name="Team" onclick="requestToJoinTeamSafe(this)"
                 class="px-3 py-1 text-sm font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 border border-indigo-300 dark:border-indigo-600 hover:border-indigo-500 dark:hover:border-indigo-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
             Request to Join
         </button>
-        """,
-            status_code=200,
-        )
+        """
+        else:
+            button_html = """
+        <button disabled
+                class="px-3 py-1 text-sm font-medium text-gray-400 dark:text-gray-600 border border-gray-300 dark:border-gray-600 rounded-md cursor-not-allowed opacity-50"
+                title="Team join requests are currently disabled">
+            Request to Join (Disabled)
+        </button>
+        """
+
+        response = HTMLResponse(content=button_html, status_code=200)
         response.headers["HX-Trigger"] = orjson.dumps({"adminTeamAction": {"refreshUnifiedTeamsList": True, "delayMs": 1000}}).decode()
         return response
 
@@ -6751,7 +6800,8 @@ def _render_user_card_html(user_obj, current_user_email: str, admin_count: int, 
             f"dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 "
             f'focus:ring-red-500" hx-delete="{root_path}/admin/users/{encoded_email}" '
             f'hx-confirm="Are you sure you want to delete this user? This action cannot be undone." '
-            f'hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>'
+            f'hx-target="closest .user-card" hx-swap="outerHTML" '
+            f'hx-on::after-request="handleDeleteUserError(event)">Delete</button>'
         )
 
     return f"""
@@ -7006,6 +7056,7 @@ async def admin_team_members_partial_html(
     request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    search: str = Query("", description="Search term to filter members by name or email"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Response:
@@ -7016,6 +7067,7 @@ async def admin_team_members_partial_html(
         request: FastAPI request object.
         page: Page number (1-indexed). Default: 1.
         per_page: Items per page. Default: 50.
+        search: Search term to filter members by name or email.
         db: Database session.
         user: Current authenticated user context.
 
@@ -7045,8 +7097,9 @@ async def admin_team_members_partial_html(
         if current_user_role != "owner":
             return HTMLResponse(content='<div class="text-red-500">Only team owners can manage members</div>', status_code=403)
 
-        # Get paginated team members
-        paginated_result = await team_service.get_team_members(team_id, page=page, per_page=per_page)
+        # Get paginated team members with optional search filter
+        search_term = search.strip() if search else ""
+        paginated_result = await team_service.get_team_members(team_id, page=page, per_page=per_page, search=search_term or None)
         members = paginated_result["data"]
         pagination = paginated_result["pagination"]
 
@@ -7057,7 +7110,8 @@ async def admin_team_members_partial_html(
         db.commit()
 
         root_path = _resolve_root_path(request)
-        next_page_url = f"{root_path}/admin/teams/{team_id}/members/partial?page={pagination.page + 1}&per_page={pagination.per_page}"
+        search_param = f"&search={urllib.parse.quote(search_term)}" if search_term else ""
+        next_page_url = f"{root_path}/admin/teams/{team_id}/members/partial?page={pagination.page + 1}&per_page={pagination.per_page}{search_param}"
         response = request.app.state.templates.TemplateResponse(
             request,
             "team_users_selector.html",
@@ -7092,17 +7146,23 @@ async def admin_team_non_members_partial_html(
     team_id: str,
     request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    per_page: int = Query(50, ge=1, le=50, description="Items per page (max 50 for non-members)"),
+    search: str = Query("", description="Search term to filter non-members by name or email"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Response:
     """Return paginated non-members for two-section layout (bottom section).
 
+    Non-members are only returned when a search term with at least 2 characters
+    is provided. Without a search term, returns an empty placeholder prompting
+    the user to search.
+
     Args:
         team_id: Team identifier.
         request: FastAPI request object.
         page: Page number (1-indexed). Default: 1.
-        per_page: Items per page. Default: 50.
+        per_page: Items per page (capped at 50). Default: 50.
+        search: Search term to filter non-members by name or email.
         db: Database session.
         user: Current authenticated user context.
 
@@ -7133,8 +7193,24 @@ async def admin_team_non_members_partial_html(
         if current_user_role != "owner":
             return HTMLResponse(content='<div class="text-red-500">Only team owners can manage members</div>', status_code=403)
 
-        # Get paginated non-members
-        paginated_result = await auth_service.list_users_not_in_team(team_id, page=page, per_page=per_page)
+        # Require a search term - do not load all non-members by default
+        search_term = search.strip() if search else ""
+        if not search_term:
+            return HTMLResponse(
+                content='<div class="text-center py-4 text-gray-500 dark:text-gray-400">Search for users by name or email to add them to this team.</div>',
+                status_code=200,
+            )
+        if len(search_term) < 2:
+            return HTMLResponse(
+                content='<div class="text-center py-4 text-gray-500 dark:text-gray-400">Type at least 2 characters to search for users.</div>',
+                status_code=200,
+            )
+
+        # Cap per_page at 50 for non-members to prevent DOM overload
+        per_page = min(per_page, 50)
+
+        # Get paginated non-members with search filter
+        paginated_result = await auth_service.list_users_not_in_team(team_id, page=page, per_page=per_page, search=search_term)
         users = paginated_result.data
         pagination = typing_cast(PaginationMeta, paginated_result.pagination)
 
@@ -7142,7 +7218,8 @@ async def admin_team_non_members_partial_html(
         db.commit()
 
         root_path = _resolve_root_path(request)
-        next_page_url = f"{root_path}/admin/teams/{team_id}/non-members/partial?page={pagination.page + 1}&per_page={pagination.per_page}"
+        search_param = f"&search={urllib.parse.quote(search_term)}" if search_term else ""
+        next_page_url = f"{root_path}/admin/teams/{team_id}/non-members/partial?page={pagination.page + 1}&per_page={pagination.per_page}{search_param}"
         response = request.app.state.templates.TemplateResponse(
             request,
             "team_users_selector.html",
@@ -7393,12 +7470,12 @@ async def admin_get_user_edit(
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Email</label>
                     <input type="email" name="email" value="{user_obj.email}" readonly
-                           class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-white">
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-white">
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Full Name</label>
                     <input type="text" name="full_name" value="{user_obj.full_name or ""}" required
-                           class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
                 </div>
                 {"" if is_editing_self else f'''<div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
@@ -7415,13 +7492,13 @@ async def admin_get_user_edit(
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">New Password (leave empty to keep current)</label>
                     <input type="password" name="password" id="password-field"
-                           class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white"
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white"
                            oninput="validatePasswordRequirements(); validatePasswordMatch();">
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Confirm New Password</label>
                     <input type="password" name="confirm_password" id="confirm-password-field"
-                           class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white"
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white"
                            oninput="validatePasswordMatch()">
                     <div id="password-match-message" class="mt-1 text-sm text-red-600 hidden">Passwords do not match</div>
                 </div>
@@ -8279,14 +8356,19 @@ async def admin_get_all_tool_ids(
                 LOGGER.debug(f"Filtering tools by gateway IDs: {non_null_ids}")
 
     # Build access conditions
-    # When team_id is specified, show ONLY items from that team (team-scoped view)
-    # Otherwise, show all accessible items (All Teams view)
+    # When team_id is specified, show items from that team plus all platform-public tools
+    # (visibility="public") so the "Select All" count and payload match what is actually
+    # visible in the edit UI. Public visibility is platform-wide regardless of team ownership.
+    # Otherwise, show all accessible items (All Teams view).
     if team_id:
         if team_id in team_ids:
             # Apply visibility check: team/public resources + user's own resources (including private)
+            # Also include all platform-public tools so they can be associated with team-owned
+            # virtual servers.
             team_access = [
                 and_(DbTool.team_id == team_id, DbTool.visibility.in_(["team", "public"])),
                 and_(DbTool.team_id == team_id, DbTool.owner_email == user_email),
+                DbTool.visibility == "public",
             ]
             query = query.where(or_(*team_access))
             LOGGER.debug(f"Filtering tool IDs by team_id: {team_id}")
@@ -8689,7 +8771,7 @@ async def admin_gateways_partial_html(
     per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     q: str = Query("", description="Search query"),
     tags: Optional[str] = Query(None, description="Tag filter expression (comma=OR, plus=AND)"),
-    include_inactive: bool = False,
+    include_inactive: bool = True,
     render: Optional[str] = Query(None),
     team_id: Optional[str] = Depends(_validated_team_id_param),
     include_public: bool = False,
@@ -9517,15 +9599,20 @@ async def admin_get_all_prompt_ids(
         query = query.where(DbPrompt.enabled.is_(True))
 
     # Build access conditions
-    # When team_id is specified, show ONLY items from that team (team-scoped view)
-    # Otherwise, show all accessible items (All Teams view)
+    # When team_id is specified, show items from that team plus all platform-public prompts
+    # (visibility="public") so the "Select All" count and payload match what is actually
+    # visible in the edit UI. Public visibility is platform-wide regardless of team ownership.
+    # Otherwise, show all accessible items (All Teams view).
     if team_id:
-        # Team-specific view: only show prompts from the specified team
+        # Team-specific view: show prompts from the specified team plus platform-public prompts
         if team_id in team_ids:
             # Apply visibility check: team/public resources + user's own resources (including private)
+            # Also include all platform-public prompts so they can be associated with team-owned
+            # virtual servers.
             team_access = [
                 and_(DbPrompt.team_id == team_id, DbPrompt.visibility.in_(["team", "public"])),
                 and_(DbPrompt.team_id == team_id, DbPrompt.owner_email == user_email),
+                DbPrompt.visibility == "public",
             ]
             query = query.where(or_(*team_access))
             LOGGER.debug(f"Filtering prompt IDs by team_id: {team_id}")
@@ -9597,15 +9684,20 @@ async def admin_get_all_resource_ids(
         query = query.where(DbResource.enabled.is_(True))
 
     # Build access conditions
-    # When team_id is specified, show ONLY items from that team (team-scoped view)
-    # Otherwise, show all accessible items (All Teams view)
+    # When team_id is specified, show items from that team plus all platform-public resources
+    # (visibility="public") so the "Select All" count and payload match what is actually
+    # visible in the edit UI. Public visibility is platform-wide regardless of team ownership.
+    # Otherwise, show all accessible items (All Teams view).
     if team_id:
-        # Team-specific view: only show resources from the specified team
+        # Team-specific view: show resources from the specified team plus platform-public resources
         if team_id in team_ids:
             # Apply visibility check: team/public resources + user's own resources (including private)
+            # Also include all platform-public resources so they can be associated with team-owned
+            # virtual servers.
             team_access = [
                 and_(DbResource.team_id == team_id, DbResource.visibility.in_(["team", "public"])),
                 and_(DbResource.team_id == team_id, DbResource.owner_email == user_email),
+                DbResource.visibility == "public",
             ]
             query = query.where(or_(*team_access))
             LOGGER.debug(f"Filtering resource IDs by team_id: {team_id}")
@@ -10058,7 +10150,7 @@ async def admin_tokens_partial_html(
 async def admin_search_tokens(
     q: str = Query("", description="Search query"),
     include_inactive: bool = False,
-    limit: int = Query(settings.pagination_default_page_size, ge=1, le=100, description="Max results"),
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Max results"),
     team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -10943,6 +11035,25 @@ async def admin_add_tool(
     input_schema_raw = form.get("input_schema")
     output_schema_raw = form.get("output_schema")
     annotations_raw = form.get("annotations")
+
+    # Parse JSON fields with validation
+    try:
+        headers = orjson.loads(headers_raw if isinstance(headers_raw, str) and headers_raw else "{}")
+        input_schema = orjson.loads(input_schema_raw if isinstance(input_schema_raw, str) and input_schema_raw else "{}")
+        output_schema = orjson.loads(output_schema_raw) if isinstance(output_schema_raw, str) and output_schema_raw else None
+        annotations = orjson.loads(annotations_raw if isinstance(annotations_raw, str) and annotations_raw else "{}")
+        query_mapping = orjson.loads(form.get("query_mapping") or "{}")
+        header_mapping = orjson.loads(form.get("header_mapping") or "{}")
+        allowlist = orjson.loads(form.get("allowlist") or "[]")
+        plugin_chain_pre = orjson.loads(form.get("plugin_chain_pre") or "[]")
+        plugin_chain_post = orjson.loads(form.get("plugin_chain_post") or "[]")
+    except orjson.JSONDecodeError as ex:
+        LOGGER.error(f"Invalid JSON in form field: {str(ex)}")
+        return ORJSONResponse(
+            content={"message": f"Invalid JSON in form field: {str(ex)}", "success": False},
+            status_code=422,
+        )
+
     tool_data: dict[str, Any] = {
         "name": form.get("name"),
         "displayName": form.get("displayName"),
@@ -10950,23 +11061,23 @@ async def admin_add_tool(
         "description": form.get("description"),
         "request_type": request_type,
         "integration_type": integration_type,
-        "headers": orjson.loads(headers_raw if isinstance(headers_raw, str) and headers_raw else "{}"),
-        "input_schema": orjson.loads(input_schema_raw if isinstance(input_schema_raw, str) and input_schema_raw else "{}"),
-        "output_schema": (orjson.loads(output_schema_raw) if isinstance(output_schema_raw, str) and output_schema_raw else None),
-        "annotations": orjson.loads(annotations_raw if isinstance(annotations_raw, str) and annotations_raw else "{}"),
+        "headers": headers,
+        "input_schema": input_schema,
+        "output_schema": output_schema,
+        "annotations": annotations,
         "jsonpath_filter": form.get("jsonpath_filter", ""),
         "auth": auth_obj,
         "tags": tags,
         "visibility": visibility,
         "team_id": team_id,
         "owner_email": user_email,
-        "query_mapping": orjson.loads(form.get("query_mapping") or "{}"),
-        "header_mapping": orjson.loads(form.get("header_mapping") or "{}"),
+        "query_mapping": query_mapping,
+        "header_mapping": header_mapping,
         "timeout_ms": int(form.get("timeout_ms")) if form.get("timeout_ms") and form.get("timeout_ms").strip() else None,
         "expose_passthrough": form.get("expose_passthrough", "true"),
-        "allowlist": orjson.loads(form.get("allowlist") or "[]"),
-        "plugin_chain_pre": orjson.loads(form.get("plugin_chain_pre") or "[]"),
-        "plugin_chain_post": orjson.loads(form.get("plugin_chain_post") or "[]"),
+        "allowlist": allowlist,
+        "plugin_chain_pre": plugin_chain_pre,
+        "plugin_chain_post": plugin_chain_post,
     }
     LOGGER.debug(f"Tool data built: {tool_data}")
     try:
@@ -11084,16 +11195,29 @@ async def admin_edit_tool(
     output_schema_raw2 = form.get("output_schema")
     annotations_raw2 = form.get("annotations")
 
+    # Parse JSON fields with validation
+    try:
+        headers = orjson.loads(headers_raw2 if isinstance(headers_raw2, str) and headers_raw2 else "{}")
+        input_schema = orjson.loads(input_schema_raw2 if isinstance(input_schema_raw2, str) and input_schema_raw2 else "{}")
+        output_schema = orjson.loads(output_schema_raw2) if isinstance(output_schema_raw2, str) and output_schema_raw2 else None
+        annotations = orjson.loads(annotations_raw2 if isinstance(annotations_raw2, str) and annotations_raw2 else "{}")
+    except orjson.JSONDecodeError as ex:
+        LOGGER.error(f"Invalid JSON in form field: {str(ex)}")
+        return ORJSONResponse(
+            content={"message": f"Invalid JSON in form field: {str(ex)}", "success": False},
+            status_code=422,
+        )
+
     tool_data: dict[str, Any] = {
         "name": form.get("name"),
         "displayName": form.get("displayName"),
         "custom_name": form.get("customName"),
         "url": form.get("url"),
         "description": form.get("description"),
-        "headers": orjson.loads(headers_raw2 if isinstance(headers_raw2, str) and headers_raw2 else "{}"),
-        "input_schema": orjson.loads(input_schema_raw2 if isinstance(input_schema_raw2, str) and input_schema_raw2 else "{}"),
-        "output_schema": (orjson.loads(output_schema_raw2) if isinstance(output_schema_raw2, str) and output_schema_raw2 else None),
-        "annotations": orjson.loads(annotations_raw2 if isinstance(annotations_raw2, str) and annotations_raw2 else "{}"),
+        "headers": headers,
+        "input_schema": input_schema,
+        "output_schema": output_schema,
+        "annotations": annotations,
         "jsonpath_filter": form.get("jsonpathFilter", ""),
         "auth": auth_obj,
         "tags": tags,
@@ -11991,6 +12115,9 @@ async def admin_add_resource(request: Request, db: Session = Depends(get_db), us
         if isinstance(ex, ResourceURIConflictError):
             LOGGER.error(f"ResourceURIConflictError in admin_add_resource: {ex}")
             return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+        if isinstance(ex, ContentSizeError):
+            LOGGER.error(f"ContentSizeError in admin_add_resource: {ex}")
+            return ORJSONResponse(content={"message": str(ex), "success": False, "actual_size": ex.actual_size, "max_size": ex.max_size}, status_code=413)
         LOGGER.error(f"Error in admin_add_resource: {ex}")
         return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
@@ -12080,6 +12207,9 @@ async def admin_edit_resource(
         if isinstance(ex, ResourceURIConflictError):
             LOGGER.error(f"ResourceURIConflictError in admin_edit_resource: {ex}")
             return ORJSONResponse(status_code=409, content={"message": str(ex), "success": False})
+        if isinstance(ex, ContentSizeError):
+            LOGGER.error(f"ContentSizeError in admin_edit_resource: {ex}")
+            return ORJSONResponse(status_code=413, content={"message": str(ex), "success": False, "actual_size": ex.actual_size, "max_size": ex.max_size})
         LOGGER.error(f"Error in admin_edit_resource: {ex}")
         return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
@@ -12267,11 +12397,8 @@ async def admin_add_prompt(request: Request, db: Session = Depends(get_db), user
     tags: List[str] = [tag.strip() for tag in tags_str.split(",") if tag.strip()] if tags_str else []
 
     try:
-        args_json = "[]"
-        args_value = form.get("arguments")
-        if isinstance(args_value, str) and args_value.strip():
-            args_json = args_value
-        arguments = orjson.loads(args_json)
+        # Validate arguments JSON using prompt service
+        arguments: List[Dict[str, Any]] = prompt_service.validate_arguments_json(args_value=form.get("arguments"), context="new prompt")
         prompt = PromptCreate(
             name=str(form["name"]),
             display_name=str(form.get("display_name") or form["name"]),
@@ -12314,6 +12441,12 @@ async def admin_add_prompt(request: Request, db: Session = Depends(get_db), user
         if isinstance(ex, PromptNameConflictError):
             LOGGER.error(f"PromptNameConflictError in admin_add_prompt: {ex}")
             return ORJSONResponse(status_code=409, content={"message": str(ex), "success": False})
+        if isinstance(ex, PromptArgumentsJSONError):
+            LOGGER.error(f"PromptArgumentsJSONError in admin_add_prompt: {ex}")
+            return ORJSONResponse(status_code=422, content={"message": str(ex), "success": False, "field": ex.field_name})
+        if isinstance(ex, ContentSizeError):
+            LOGGER.error(f"ContentSizeError in admin_add_prompt: {ex}")
+            return ORJSONResponse(status_code=413, content={"message": str(ex), "success": False, "actual_size": ex.actual_size, "max_size": ex.max_size})
         LOGGER.error(f"Error in admin_add_prompt: {ex}")
         return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
@@ -12365,12 +12498,13 @@ async def admin_edit_prompt(
     team_id = await team_service.verify_team_for_user(user_email, team_id)
     LOGGER.info(f"Verifying team for user {user_email} with team_id {team_id}")
 
-    args_json: str = str(form.get("arguments")) or "[]"
-    arguments = orjson.loads(args_json)
     # Parse tags from comma-separated string
     tags_str = str(form.get("tags", ""))
     tags: List[str] = [tag.strip() for tag in tags_str.split(",") if tag.strip()] if tags_str else []
     try:
+        # Validate arguments JSON using prompt service; preserve existing when field absent
+        args_value = form.get("arguments")
+        arguments = prompt_service.validate_arguments_json(args_value, context="prompt update") if args_value is not None else None
         mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)
         prompt = PromptUpdate(
             custom_name=str(form.get("customName") or form.get("name")),
@@ -12411,6 +12545,12 @@ async def admin_edit_prompt(
         if isinstance(ex, PromptNameConflictError):
             LOGGER.error(f"PromptNameConflictError in admin_edit_prompt: {ex}")
             return ORJSONResponse(status_code=409, content={"message": str(ex), "success": False})
+        if isinstance(ex, PromptArgumentsJSONError):
+            LOGGER.error(f"PromptArgumentsJSONError in admin_edit_prompt: {ex}")
+            return ORJSONResponse(status_code=422, content={"message": str(ex), "success": False, "field": ex.field_name})
+        if isinstance(ex, ContentSizeError):
+            LOGGER.error(f"ContentSizeError in admin_edit_prompt: {ex}")
+            return ORJSONResponse(status_code=413, content={"message": str(ex), "success": False, "actual_size": ex.actual_size, "max_size": ex.max_size})
         LOGGER.error(f"Error in admin_edit_prompt: {ex}")
         return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
@@ -15027,6 +15167,13 @@ async def admin_test_a2a_agent(
 ) -> JSONResponse:
     """Test A2A agent via admin UI.
 
+    Invokes the specified A2A agent with a test message and returns the result.
+    Returns appropriate HTTP status codes based on the failure type:
+    - 404: Agent not found or user lacks access
+    - 502: Agent disabled, unreachable, or returning errors
+    - 422: Invalid test parameters
+    - 500: Unexpected system errors
+
     Args:
         agent_id: Agent ID
         request: FastAPI request object containing optional 'query' field
@@ -15034,18 +15181,41 @@ async def admin_test_a2a_agent(
         user: Authenticated user
 
     Returns:
-        JSON response with test results
+        JSON response with test results. On success, includes:
+        - success: True
+        - result: Agent response
+        - agent_name: Name of the tested agent
+        - test_timestamp: Unix timestamp of the test
+
+        On failure, includes:
+        - success: False
+        - error: Error message (sanitized to prevent credential leakage)
+        - error_type: Type of error (not_found, agent_error, validation_error, internal_error)
+        - agent_id: ID of the agent that was tested
 
     Raises:
-        HTTPException: If A2A features are disabled
+        HTTPException: If A2A features are disabled (403)
+
+    Note:
+        Error messages are sanitized by a2a_service to prevent credential leakage.
+        Returns 404 (not 403) for access denied to avoid leaking agent existence.
     """
     if not a2a_service or not settings.mcpgateway_a2a_enabled:
         return ORJSONResponse(content={"success": False, "error": "A2A features are disabled"}, status_code=403)
 
     try:
         user_email = get_user_email(user)
+        is_admin = user.get("is_admin", False) if isinstance(user, dict) else False
+        token_teams = user.get("token_teams") if isinstance(user, dict) else None
+        # Missing token_teams key for non-admin = public-only (per normalize_token_teams rules).
+        # Only admin users retain None (admin bypass); all others default to [].
+        if not is_admin and token_teams is None:
+            token_teams = []
+        # Admin users with unrestricted tokens get full bypass (both None);
+        # non-admin users pass their actual email and team scoping.
+        invoke_user_email = None if (is_admin and token_teams is None) else user_email
         # Get the agent by ID
-        agent = await a2a_service.get_agent(db, agent_id)
+        agent = await a2a_service.get_agent(db, agent_id, user_email=invoke_user_email, token_teams=token_teams)
 
         # Parse request body to get user-provided query
         default_message = "Hello from ContextForge Admin UI test!"
@@ -15081,15 +15251,37 @@ async def admin_test_a2a_agent(
             agent.name,
             test_params,
             "admin_test",
-            user_email=user_email,
+            user_email=invoke_user_email,
             user_id=user_email,
+            token_teams=token_teams,
         )
 
         return ORJSONResponse(content={"success": True, "result": result, "agent_name": agent.name, "test_timestamp": time.time()})
 
+    except A2AAgentNotFoundError as e:
+        LOGGER.warning(f"A2A agent not found or access denied for {agent_id}: {e}")
+        return ORJSONResponse(
+            content={"success": False, "error": str(e), "error_type": "not_found", "agent_id": agent_id},
+            status_code=404,
+        )
+    except A2AAgentError as e:
+        LOGGER.error(f"A2A agent error for {agent_id}: {e}")
+        return ORJSONResponse(
+            content={"success": False, "error": str(e), "error_type": "agent_error", "agent_id": agent_id},
+            status_code=502,
+        )
+    except ValidationError as e:
+        LOGGER.warning(f"Validation error testing A2A agent {agent_id}: {e}")
+        return ORJSONResponse(
+            content={"success": False, "error": str(e), "error_type": "validation_error", "agent_id": agent_id},
+            status_code=422,
+        )
     except Exception as e:
-        LOGGER.error(f"Error testing A2A agent {agent_id}: {e}")
-        return ORJSONResponse(content={"success": False, "error": str(e), "agent_id": agent_id}, status_code=500)
+        LOGGER.error(f"Unexpected error testing A2A agent {agent_id}: {e}")
+        return ORJSONResponse(
+            content={"success": False, "error": str(e), "error_type": "internal_error", "agent_id": agent_id},
+            status_code=500,
+        )
 
 
 # gRPC Service Management Endpoints
@@ -17440,7 +17632,7 @@ def _get_latency_heatmap_python(db: Session, cutoff_time: datetime, hours: int, 
 async def get_top_slow_endpoints(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(10, ge=1, le=100, description="Number of results"),
+    limit: int = Query(10, ge=1, le=settings.pagination_max_page_size, description="Number of results"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -17449,7 +17641,7 @@ async def get_top_slow_endpoints(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Number of results to return (1-100)
+        limit: Number of results to return (1-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -17509,7 +17701,7 @@ async def get_top_slow_endpoints(
 async def get_top_volume_endpoints(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(10, ge=1, le=100, description="Number of results"),
+    limit: int = Query(10, ge=1, le=settings.pagination_max_page_size, description="Number of results"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -17518,7 +17710,7 @@ async def get_top_volume_endpoints(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Number of results to return (1-100)
+        limit: Number of results to return (1-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -17576,7 +17768,7 @@ async def get_top_volume_endpoints(
 async def get_top_error_endpoints(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(10, ge=1, le=100, description="Number of results"),
+    limit: int = Query(10, ge=1, le=settings.pagination_max_page_size, description="Number of results"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -17585,7 +17777,7 @@ async def get_top_error_endpoints(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Number of results to return (1-100)
+        limit: Number of results to return (1-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -17695,7 +17887,7 @@ async def get_latency_heatmap(
 async def get_tool_usage(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(20, ge=5, le=100, description="Number of tools to return"),
+    limit: int = Query(20, ge=5, le=settings.pagination_max_page_size, description="Number of tools to return"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -17704,7 +17896,7 @@ async def get_tool_usage(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Maximum number of tools to return (5-100)
+        limit: Maximum number of tools to return (5-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -17768,7 +17960,7 @@ async def get_tool_usage(
 async def get_tool_performance(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(20, ge=5, le=100, description="Number of tools to return"),
+    limit: int = Query(20, ge=5, le=settings.pagination_max_page_size, description="Number of tools to return"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -17777,7 +17969,7 @@ async def get_tool_performance(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Maximum number of tools to return (5-100)
+        limit: Maximum number of tools to return (5-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -17820,7 +18012,7 @@ async def get_tool_performance(
 async def get_tool_errors(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(20, ge=5, le=100, description="Number of tools to return"),
+    limit: int = Query(20, ge=5, le=settings.pagination_max_page_size, description="Number of tools to return"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -17829,7 +18021,7 @@ async def get_tool_errors(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Maximum number of tools to return (5-100)
+        limit: Maximum number of tools to return (5-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -17892,7 +18084,7 @@ async def get_tool_errors(
 async def get_tool_chains(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(20, ge=5, le=100, description="Number of chains to return"),
+    limit: int = Query(20, ge=5, le=settings.pagination_max_page_size, description="Number of chains to return"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -17901,7 +18093,7 @@ async def get_tool_chains(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Maximum number of chains to return (5-100)
+        limit: Maximum number of chains to return (5-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -18005,7 +18197,7 @@ async def get_tools_partial(
 async def get_prompt_usage(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(20, ge=5, le=100, description="Number of prompts to return"),
+    limit: int = Query(20, ge=5, le=settings.pagination_max_page_size, description="Number of prompts to return"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -18014,7 +18206,7 @@ async def get_prompt_usage(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Maximum number of prompts to return (5-100)
+        limit: Maximum number of prompts to return (5-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -18078,7 +18270,7 @@ async def get_prompt_usage(
 async def get_prompt_performance(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(20, ge=5, le=100, description="Number of prompts to return"),
+    limit: int = Query(20, ge=5, le=settings.pagination_max_page_size, description="Number of prompts to return"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -18087,7 +18279,7 @@ async def get_prompt_performance(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Maximum number of prompts to return (5-100)
+        limit: Maximum number of prompts to return (5-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -18227,7 +18419,7 @@ async def get_prompts_partial(
 async def get_resource_usage(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(20, ge=5, le=100, description="Number of resources to return"),
+    limit: int = Query(20, ge=5, le=settings.pagination_max_page_size, description="Number of resources to return"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -18236,7 +18428,7 @@ async def get_resource_usage(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Maximum number of resources to return (5-100)
+        limit: Maximum number of resources to return (5-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 
@@ -18300,7 +18492,7 @@ async def get_resource_usage(
 async def get_resource_performance(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
-    limit: int = Query(20, ge=5, le=100, description="Number of resources to return"),
+    limit: int = Query(20, ge=5, le=settings.pagination_max_page_size, description="Number of resources to return"),
     _user=Depends(get_current_user_with_permissions),
     db: Session = Depends(get_db),
 ):
@@ -18309,7 +18501,7 @@ async def get_resource_performance(
     Args:
         request: FastAPI request object
         hours: Number of hours to look back (1-168)
-        limit: Maximum number of resources to return (5-100)
+        limit: Maximum number of resources to return (5-pagination_max_page_size)
         _user: Authenticated user (required by dependency)
         db: Database session for permission checks.
 

@@ -400,19 +400,15 @@ Please note: Currently, arm64 is not supported on production. If you are e.g. ru
 
 ### 🚀 Quick Start - Docker Compose
 
-Get a full stack running with MariaDB and Redis in under 30 seconds:
+Get a full stack running with PostgreSQL and Redis in under 30 seconds:
 
 ```bash
 # Clone and start the stack
 git clone https://github.com/IBM/mcp-context-forge.git
 cd mcp-context-forge
 
-# Start with MariaDB (recommended for production)
+# Start with PostgreSQL (recommended for production)
 docker compose up -d
-
-# Or start with PostgreSQL
-# Uncomment postgres in docker-compose.yml and comment mariadb section
-# docker compose up -d
 
 # Check status
 docker compose ps
@@ -427,7 +423,7 @@ docker compose exec gateway python3 -m mcpgateway.utils.create_jwt_token \
 ```
 
 **What you get:**
-- 🗄️ **MariaDB 10.6** - Production-ready database with 36+ tables
+- 🗄️ **PostgreSQL** - Production-ready database with 36+ tables
 - 🚀 **ContextForge** - Full-featured gateway with Admin UI
 - 📊 **Redis** - High-performance caching and session storage
 - 🔧 **Admin Tools** - pgAdmin, Redis Insight for database management
@@ -466,15 +462,7 @@ Deploy to Kubernetes with enterprise-grade features:
 git clone https://github.com/IBM/mcp-context-forge.git
 cd mcp-context-forge/charts/mcp-stack
 
-# Install with MariaDB
-helm install mcp-gateway . \
-  --set mcpContextForge.secret.PLATFORM_ADMIN_EMAIL=admin@yourcompany.com \
-  --set mcpContextForge.secret.PLATFORM_ADMIN_PASSWORD=changeme \
-  --set mcpContextForge.secret.JWT_SECRET_KEY=your-secret-key \
-  --set postgres.enabled=false \
-  --set mariadb.enabled=true
-
-# Or install with PostgreSQL (default)
+# Install with PostgreSQL (default)
 helm install mcp-gateway . \
   --set mcpContextForge.secret.PLATFORM_ADMIN_EMAIL=admin@yourcompany.com \
   --set mcpContextForge.secret.PLATFORM_ADMIN_PASSWORD=changeme \
@@ -501,7 +489,7 @@ kubectl exec deployment/mcp-gateway-mcp-context-forge -- \
 
 **Enterprise Features:**
 - 🔄 **Auto-scaling** - HPA with CPU/memory targets
-- 🗄️ **Database Choice** - PostgreSQL, MariaDB, or MySQL
+- 🗄️ **Database Choice** - PostgreSQL (prod), SQLite (dev)
 - 📊 **Observability** - Prometheus metrics, OpenTelemetry tracing
 - 🔒 **Security** - RBAC, network policies, secret management
 - 🚀 **High Availability** - Multi-replica deployments with Redis clustering
@@ -759,6 +747,17 @@ These settings are enabled by default for security—only disable for backward c
 | `REQUIRE_JTI` | Require JTI claim in tokens for revocation support | `true` |
 | `REQUIRE_TOKEN_EXPIRATION` | Require exp claim in tokens | `true` |
 | `PUBLIC_REGISTRATION_ENABLED` | Allow public user self-registration | `false` |
+
+### 🛡️ Content Security
+
+Content size limits prevent DoS attacks and ensure system stability:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CONTENT_MAX_RESOURCE_SIZE` | Maximum resource content size (bytes) | `102400` (100KB) |
+| `CONTENT_MAX_PROMPT_SIZE` | Maximum prompt template size (bytes) | `10240` (10KB) |
+
+**Note:** Size limits apply only to new create/update operations. Existing content is not retroactively validated.
 
 ### ⚙️ Project Defaults (Dev Setup)
 
