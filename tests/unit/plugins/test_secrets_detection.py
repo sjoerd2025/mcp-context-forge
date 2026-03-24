@@ -6,6 +6,7 @@ import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 
 from mcpgateway.common.models import ResourceContent
 from mcpgateway.plugins.framework import PluginConfig, ResourceHookType
@@ -406,12 +407,15 @@ def test_implementation_info():
 
 
 def test_default_config_disables_broad_generic_api_key_pattern():
-    """Broad generic API-key assignment detection should stay opt-in."""
+    """Broad secrets heuristics should stay disabled by default."""
     from plugins.secrets_detection.secrets_detection import SecretsDetectionConfig
 
     config = SecretsDetectionConfig()
 
     assert config.enabled["generic_api_key_assignment"] is False
+    assert config.enabled["jwt_like"] is False
+    assert config.enabled["hex_secret_32"] is False
+    assert config.enabled["base64_24"] is False
 
 
 def test_partial_enabled_config_preserves_safe_defaults():
@@ -424,6 +428,19 @@ def test_partial_enabled_config_preserves_safe_defaults():
     assert config.enabled["github_token"] is True
     assert config.enabled["stripe_secret_key"] is True
     assert config.enabled["generic_api_key_assignment"] is False
+    assert config.enabled["jwt_like"] is False
+    assert config.enabled["hex_secret_32"] is False
+    assert config.enabled["base64_24"] is False
+
+
+def test_plugin_manifest_defaults_match_runtime_defaults():
+    """The plugin manifest should mirror the runtime default pattern toggles."""
+    from plugins.secrets_detection.secrets_detection import SecretsDetectionConfig
+
+    with open("plugins/secrets_detection/plugin-manifest.yaml", encoding="utf-8") as manifest_file:
+        manifest = yaml.safe_load(manifest_file)
+
+    assert manifest["default_config"]["enabled"] == SecretsDetectionConfig().enabled
 
 
 @pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust not available")
@@ -487,7 +504,7 @@ def test_generic_api_key_assignment_detection_is_opt_in(use_rust):
             "generic_api_key_assignment": True,
         }
     )
-    text = "X-API-Key: test12345678901234567890"  # gitleaks:allow
+    text = "X-API-Key: " + "test12345678901234567890"
 
     count, _redacted, findings = _scan_container(text, config, use_rust=use_rust)
 

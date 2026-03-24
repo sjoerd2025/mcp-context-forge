@@ -655,11 +655,14 @@ plugins:
         aws_access_key_id: true
         aws_secret_access_key: true
         google_api_key: true
+        github_token: true
+        stripe_secret_key: true
+        generic_api_key_assignment: false  # Opt-in broad assignment heuristic
         slack_token: true
         private_key_block: true
-        jwt_like: true
-        hex_secret_32: true
-        base64_24: true  # Broad intrinsic-shape heuristic; can still catch assignment-style values by matching the value itself
+        jwt_like: false  # Broad intrinsic-shape heuristic; disable by default to avoid false-positive blocking
+        hex_secret_32: false  # Broad intrinsic-shape heuristic; disable by default to avoid false-positive blocking
+        base64_24: false  # Broad intrinsic-shape heuristic; disable by default to avoid false-positive blocking
       redact: false
       redaction_text: "***REDACTED***"
       block_on_detection: true

@@ -15,6 +15,9 @@ impl Default for SecretsDetectionConfig {
         let mut enabled: HashMap<String, bool> =
             PATTERNS.keys().map(|&k| (k.to_string(), true)).collect();
         enabled.insert("generic_api_key_assignment".to_string(), false);
+        enabled.insert("jwt_like".to_string(), false);
+        enabled.insert("hex_secret_32".to_string(), false);
+        enabled.insert("base64_24".to_string(), false);
 
         Self {
             enabled,
@@ -50,8 +53,27 @@ mod tests {
             Some(&false),
             "Broad generic API-key detection should be opt-in"
         );
+        assert_eq!(
+            config.enabled.get("jwt_like"),
+            Some(&false),
+            "JWT-like broad heuristic should be disabled by default"
+        );
+        assert_eq!(
+            config.enabled.get("hex_secret_32"),
+            Some(&false),
+            "Hex broad heuristic should be disabled by default"
+        );
+        assert_eq!(
+            config.enabled.get("base64_24"),
+            Some(&false),
+            "Base64 broad heuristic should be disabled by default"
+        );
         for (pattern_name, enabled) in config.enabled.iter() {
-            if pattern_name == "generic_api_key_assignment" {
+            if pattern_name == "generic_api_key_assignment"
+                || pattern_name == "jwt_like"
+                || pattern_name == "hex_secret_32"
+                || pattern_name == "base64_24"
+            {
                 continue;
             }
             assert!(

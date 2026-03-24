@@ -60,12 +60,10 @@ PATTERNS = {
     "google_api_key": re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
     "github_token": re.compile(r"\bgh[opusr]_[A-Za-z0-9]{36}\b"),
     "stripe_secret_key": re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"),
-    "generic_api_key_assignment": re.compile(
-        r"""(?ix)
+    "generic_api_key_assignment": re.compile(r"""(?ix)
         \b(?:(?:x[-_])?api[-_]?key|apikey|api[_-]?token|access[_-]?token|bearer[_-]?token|auth[_-]?token)
         \b\s*[:=]\s*['"]?[A-Za-z0-9_\-]{20,}['"]?
-        """
-    ),
+        """),
     "slack_token": re.compile(r"\bxox[abpqr]-[0-9A-Za-z\-]{10,48}\b"),
     "private_key_block": re.compile(r"-----BEGIN (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----"),
     "jwt_like": re.compile(r"\beyJ[a-zA-Z0-9_\-]{10,}\.eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\b"),
@@ -85,6 +83,9 @@ def _default_enabled_patterns() -> Dict[str, bool]:
     """Return the default enabled-state map for all supported patterns."""
     enabled = {k: True for k in PATTERNS.keys()}
     enabled["generic_api_key_assignment"] = False
+    enabled["jwt_like"] = False
+    enabled["hex_secret_32"] = False
+    enabled["base64_24"] = False
     return enabled
 
 
@@ -222,11 +223,7 @@ class SecretsDetectionPlugin(Plugin):
 
     def _warn_on_broad_patterns(self) -> None:
         """Warn when broad heuristic patterns are enabled in the plugin config."""
-        enabled_broad_patterns = sorted(
-            pattern_name
-            for pattern_name in BROAD_PATTERNS
-            if self._cfg.enabled.get(pattern_name, False)
-        )
+        enabled_broad_patterns = sorted(pattern_name for pattern_name in BROAD_PATTERNS if self._cfg.enabled.get(pattern_name, False))
         if enabled_broad_patterns:
             logger.warning(
                 "Broad secrets heuristics enabled: %s. These patterns are useful for generic API key/token coverage but can increase false positives.",

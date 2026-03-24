@@ -20,7 +20,7 @@ SPDX-License-Identifier: Apache-2.0
 
 import os
 import random
-from locust import HttpUser, task, between
+from locust import between, task
 from locust.contrib.fasthttp import FastHttpUser
 
 
@@ -36,7 +36,7 @@ class SecretsDetectionUser(FastHttpUser):
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
-        
+
         # Track secret detection effectiveness
         self.secrets_blocked_count = 0
         self.secrets_not_blocked_count = 0
@@ -101,12 +101,10 @@ class SecretsDetectionUser(FastHttpUser):
                 self.secrets_blocked_count += 1
                 response.success()
             elif response.status_code == 200:
-                # Secret was not blocked - this indicates secrets detection may not be working
                 self.secrets_not_blocked_count += 1
-                response.success()  # Don't fail the load test, but track it
-                if self.secrets_not_blocked_count % 10 == 0:
-                    print(f"⚠️  Warning: {self.secrets_not_blocked_count} secrets not blocked (may indicate detection disabled)")
+                response.failure("Secret-bearing prompt unexpectedly succeeded with HTTP 200")
             else:
                 response.failure(f"Unexpected status {response.status_code}")
+
 
 # Made with Bob

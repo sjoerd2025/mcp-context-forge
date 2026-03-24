@@ -232,10 +232,12 @@ mod tests {
 
     #[test]
     fn test_detect_and_redact_hex_and_base64() {
-        let cfg = SecretsDetectionConfig {
+        let mut cfg = SecretsDetectionConfig {
             redact: true,
             ..Default::default()
         };
+        cfg.enabled.insert("hex_secret_32".to_string(), true);
+        cfg.enabled.insert("base64_24".to_string(), true);
 
         // Test that hex secrets are detected
         let hex_text = "secret=0123456789abcdef0123456789abcdef";
@@ -297,10 +299,11 @@ mod tests {
 
     #[test]
     fn test_detect_and_redact_jwt() {
-        let cfg = SecretsDetectionConfig {
+        let mut cfg = SecretsDetectionConfig {
             redact: true,
             ..Default::default()
         };
+        cfg.enabled.insert("jwt_like".to_string(), true);
 
         let text = "Authorization: Bearer eyJfake_header_12345.eyJfake_payload_1234.fake_signature_12345678";
         let (findings, redacted) = detect_and_redact(text, &cfg);
@@ -726,10 +729,11 @@ mod tests {
 
     #[test]
     fn test_detect_and_redact_overlapping_patterns() {
-        let cfg = SecretsDetectionConfig {
+        let mut cfg = SecretsDetectionConfig {
             redact: true,
             ..Default::default()
         };
+        cfg.enabled.insert("base64_24".to_string(), true);
 
         // A base64 string that might also match hex pattern
         let text = "secret=SGVsbG8gV29ybGQgdGhpcyBpcyBhIGxvbmcgYmFzZTY0IGVuY29kZWQgc3RyaW5n";

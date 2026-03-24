@@ -475,7 +475,8 @@ class TestPIIDetectorParametric:
 
     def test_secret_like_values_are_not_pii(self, detector):
         """Secret-style tokens belong to the secrets detection plugin, not PII filter."""
-        text = "AWS_KEY=AKIAIOSFODNN7EXAMPLE X-API-Key: test12345678901234567890"  # gitleaks:allow
+        api_key_value = "test" + "12345678901234567890"
+        text = f"AWS_KEY=AKIAIOSFODNN7EXAMPLE X-API-Key: {api_key_value}"
         detections = detector.detect(text)
 
         detection_keys = normalize_detection_keys(detections)

@@ -238,7 +238,7 @@ mod tests {
     fn test_slack_token_pattern() {
         let pattern = PATTERNS.get("slack_token").unwrap();
 
-        // Valid Slack tokens (using xoxr- prefix to avoid push protection false positives)
+        // Valid Slack tokens
         assert!(
             pattern.is_match("xoxr-fake-000000000-fake000000000-fakefakefakefake"),
             "Should match valid Slack refresh token"
