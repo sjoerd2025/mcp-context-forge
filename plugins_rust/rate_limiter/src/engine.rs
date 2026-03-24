@@ -3,9 +3,14 @@
 //
 // `RateLimiterEngine` — the single PyO3-exposed class (IFACE-02).
 //
-// Python calls `evaluate_many(checks)` once per hook invocation (ARCH-01).
-// All dimension aggregation happens here (ARCH-02).
+// Python calls `check(user, tenant, tool, now_unix)` once per hook
+// invocation (ARCH-01).  The engine builds dimension keys, evaluates,
+// aggregates, and returns pre-built header/meta dicts (ARCH-02).
 // The Python wrapper is policy-only and never does rate math (ARCH-03).
+//
+// The older `evaluate_many()` / `evaluate_many_async()` entry points are
+// retained for backward compatibility and test use but are not on the
+// production hot path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,7 +47,7 @@ enum EngineBackend {
 /// High-performance rate limiter engine.
 ///
 /// Construct once per plugin instance (`__init__`), then call
-/// `evaluate_many()` on every hook invocation.
+/// `check()` / `check_async()` on every hook invocation.
 ///
 /// Backend is selected at init time from the config dict:
 /// - `backend: "memory"` (default) — in-process counting via `MemoryStore`

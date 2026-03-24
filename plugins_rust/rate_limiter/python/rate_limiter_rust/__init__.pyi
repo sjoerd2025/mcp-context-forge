@@ -12,11 +12,8 @@ __all__ = [
 @typing.final
 class EvalDimension:
     r"""
-    The aggregated result returned to Python via `evaluate_many()`.
-
-    Contains the most restrictive outcome across all active dimensions
-    (min remaining, earliest unblock among blocked dimensions — matching
-    Python `_select_most_restrictive`).
+    The outcome of a single active dimension, exposed to Python for
+    per-dimension inspection (e.g. which dimension blocked the request).
     """
     @property
     def remaining(self) -> builtins.int:
