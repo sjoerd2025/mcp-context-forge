@@ -12,11 +12,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rate_limiter_rust::{
-    clock::FakeClock,
-    config::Algorithm,
-    memory::MemoryStore,
-};
+use rate_limiter_rust::{clock::FakeClock, config::Algorithm, memory::MemoryStore};
 
 const T0_UNIX: i64 = 1_000_000;
 const LIMIT: u64 = 100;
@@ -90,9 +86,30 @@ fn bench_multi_dim(c: &mut Criterion) {
             handle.advance_secs(61);
             let now_mono = handle.monotonic_nanos();
             let now_unix = handle.unix_secs();
-            let _r1 = store.check_and_increment("user:alice", LIMIT, WINDOW, Algorithm::FixedWindow, now_mono, now_unix);
-            let _r2 = store.check_and_increment("tenant:acme", LIMIT * 100, WINDOW, Algorithm::FixedWindow, now_mono, now_unix);
-            let _r3 = store.check_and_increment("tool:search", LIMIT / 10, WINDOW, Algorithm::FixedWindow, now_mono, now_unix);
+            let _r1 = store.check_and_increment(
+                "user:alice",
+                LIMIT,
+                WINDOW,
+                Algorithm::FixedWindow,
+                now_mono,
+                now_unix,
+            );
+            let _r2 = store.check_and_increment(
+                "tenant:acme",
+                LIMIT * 100,
+                WINDOW,
+                Algorithm::FixedWindow,
+                now_mono,
+                now_unix,
+            );
+            let _r3 = store.check_and_increment(
+                "tool:search",
+                LIMIT / 10,
+                WINDOW,
+                Algorithm::FixedWindow,
+                now_mono,
+                now_unix,
+            );
         })
     });
 }
@@ -133,7 +150,14 @@ fn bench_fixed_window_blocked(c: &mut Criterion) {
     let now_mono = handle.monotonic_nanos();
     let now_unix = handle.unix_secs();
     for _ in 0..LIMIT {
-        store.check_and_increment("user:blocked", LIMIT, WINDOW, Algorithm::FixedWindow, now_mono, now_unix);
+        store.check_and_increment(
+            "user:blocked",
+            LIMIT,
+            WINDOW,
+            Algorithm::FixedWindow,
+            now_mono,
+            now_unix,
+        );
     }
     // Now every call hits the blocked path
     c.bench_function("fixed_window/blocked_path", |b| {

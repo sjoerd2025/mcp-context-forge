@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _RATE_LIMITER_FORCE_PYTHON = os.environ.get("RATE_LIMITER_FORCE_PYTHON", "").strip().lower() in ("1", "true", "yes")
+_RateLimiterEngine: Any = None  # Assigned below when the Rust extension is available.
 
 if _RATE_LIMITER_FORCE_PYTHON:
     _RUST_AVAILABLE = False

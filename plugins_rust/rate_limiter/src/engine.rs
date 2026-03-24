@@ -18,8 +18,8 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use pyo3_stub_gen::derive::*;
 use pyo3_async_runtimes::tokio::future_into_py;
+use pyo3_stub_gen::derive::*;
 
 use crate::clock::{Clock, SystemClock};
 use crate::config::{ConfigError, EngineConfig};
@@ -312,7 +312,12 @@ impl RateLimiterEngine {
                     let meta = PyDict::new(py);
                     meta.set_item("limited", false)?;
                     let tup = pyo3::types::PyTuple::new(
-                        py, [true.into_pyobject(py)?.to_owned().into_any(), headers.into_any(), meta.into_any()],
+                        py,
+                        [
+                            true.into_pyobject(py)?.to_owned().into_any(),
+                            headers.into_any(),
+                            meta.into_any(),
+                        ],
                     )?;
                     Ok(tup.into())
                 })
@@ -334,7 +339,12 @@ impl RateLimiterEngine {
                         .into_iter()
                         .map(|(key, limit_count, window_nanos)| {
                             store.check_and_increment(
-                                &key, limit_count, window_nanos, algorithm, now_mono, now_unix,
+                                &key,
+                                limit_count,
+                                window_nanos,
+                                algorithm,
+                                now_mono,
+                                now_unix,
                             )
                         })
                         .collect()
@@ -350,7 +360,12 @@ impl RateLimiterEngine {
                 let headers = build_headers_dict(py, &eval, include_retry_after)?;
                 let meta = build_meta_dict(py, &eval, now_unix)?;
                 let tup = pyo3::types::PyTuple::new(
-                    py, [eval.allowed.into_pyobject(py)?.to_owned().into_any(), headers.into_any(), meta.into_any()],
+                    py,
+                    [
+                        eval.allowed.into_pyobject(py)?.to_owned().into_any(),
+                        headers.into_any(),
+                        meta.into_any(),
+                    ],
                 )?;
                 Ok(tup.into())
             })
@@ -365,7 +380,12 @@ impl RateLimiterEngine {
 impl RateLimiterEngine {
     /// Build dimension checks from engine config.
     /// Mirrors Python `_build_rust_checks()` but runs in Rust.
-    fn build_checks(&self, user: &str, tenant: Option<&str>, tool: &str) -> Vec<(String, u64, u64)> {
+    fn build_checks(
+        &self,
+        user: &str,
+        tenant: Option<&str>,
+        tool: &str,
+    ) -> Vec<(String, u64, u64)> {
         let mut checks = Vec::with_capacity(3);
         if let Some(ref rl) = self.config.by_user {
             checks.push((format!("user:{}", user), rl.count, rl.window_nanos));
