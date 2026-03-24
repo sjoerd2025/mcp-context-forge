@@ -339,10 +339,12 @@ impl RedisRateLimiter {
         let result = match self.algorithm {
             Algorithm::FixedWindow => self.eval_fixed(&mut conn, checks, now_unix).await,
             Algorithm::SlidingWindow => {
-                self.eval_sliding(&mut conn, checks, now_float, now_unix).await
+                self.eval_sliding(&mut conn, checks, now_float, now_unix)
+                    .await
             }
             Algorithm::TokenBucket => {
-                self.eval_token_bucket(&mut conn, checks, now_float, now_unix).await
+                self.eval_token_bucket(&mut conn, checks, now_float, now_unix)
+                    .await
             }
         };
         if result.is_err() {
