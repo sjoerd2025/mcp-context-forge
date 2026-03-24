@@ -524,10 +524,13 @@ class ToolCreate(BaseModel):
 
         # Note: backticks (`) are allowed as they are commonly used in Markdown
         # for inline code examples in tool descriptions.
+        # Single "|" is intentionally excluded: it is a valid character in LogQL,
+        # PromQL, regex patterns, and Markdown tables. "||" already covers the
+        # dangerous shell OR case.
         # When VALIDATION_STRICT=false these patterns produce a warning only so
         # that MCP servers with Markdown-formatted descriptions (e.g. "> quote",
-        # "< input", "cmd | grep") can register without error.
-        forbidden_patterns = ["&&", ";", "||", "$(", "|", "> ", "< "]
+        # "< input") can register without error.
+        forbidden_patterns = ["&&", ";", "||", "$(", "> ", "< "]
         for pat in forbidden_patterns:
             if pat in v:
                 if settings.validation_strict:
@@ -1079,10 +1082,13 @@ class ToolUpdate(BaseModelWithConfigDict):
 
         # Note: backticks (`) are allowed as they are commonly used in Markdown
         # for inline code examples in tool descriptions.
+        # Single "|" is intentionally excluded: it is a valid character in LogQL,
+        # PromQL, regex patterns, and Markdown tables. "||" already covers the
+        # dangerous shell OR case.
         # When VALIDATION_STRICT=false these patterns produce a warning only so
         # that MCP servers with Markdown-formatted descriptions (e.g. "> quote",
-        # "< input", "cmd | grep") can be updated without error.
-        forbidden_patterns = ["&&", ";", "||", "$(", "|", "> ", "< "]
+        # "< input") can be updated without error.
+        forbidden_patterns = ["&&", ";", "||", "$(", "> ", "< "]
         for pat in forbidden_patterns:
             if pat in v:
                 if settings.validation_strict:
