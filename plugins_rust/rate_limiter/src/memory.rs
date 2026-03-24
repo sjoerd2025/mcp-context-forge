@@ -122,7 +122,13 @@ impl MemoryStore {
             let read = self.inner.read();
             if let Some(key_lock) = read.get(key) {
                 let mut state = key_lock.write();
-                Some(evaluate_state(&mut state, limit, window_nanos, now_mono, now_unix))
+                Some(evaluate_state(
+                    &mut state,
+                    limit,
+                    window_nanos,
+                    now_mono,
+                    now_unix,
+                ))
             } else {
                 None
             }
@@ -153,7 +159,12 @@ impl MemoryStore {
 // ---------------------------------------------------------------------------
 
 /// Create the initial key state for a new rate-limit key.
-fn new_key_state(algorithm: Algorithm, limit: u64, now_mono: Nanos, now_unix: UnixSecs) -> KeyState {
+fn new_key_state(
+    algorithm: Algorithm,
+    limit: u64,
+    now_mono: Nanos,
+    now_unix: UnixSecs,
+) -> KeyState {
     match algorithm {
         Algorithm::FixedWindow => KeyState::FixedWindow {
             count: 0,
@@ -171,18 +182,41 @@ fn new_key_state(algorithm: Algorithm, limit: u64, now_mono: Nanos, now_unix: Un
 }
 
 /// Dispatch to the correct algorithm based on the key state variant.
-fn evaluate_state(state: &mut KeyState, limit: u64, window_nanos: u64, now_mono: Nanos, now_unix: UnixSecs) -> DimResult {
+fn evaluate_state(
+    state: &mut KeyState,
+    limit: u64,
+    window_nanos: u64,
+    now_mono: Nanos,
+    now_unix: UnixSecs,
+) -> DimResult {
     match state {
         KeyState::FixedWindow {
             count,
             window_start,
             window_start_unix,
-        } => fixed_window(count, window_start, window_start_unix, limit, window_nanos, now_mono, now_unix),
-        KeyState::SlidingWindow { timestamps } => sliding_window(timestamps, limit, window_nanos, now_mono, now_unix),
+        } => fixed_window(
+            count,
+            window_start,
+            window_start_unix,
+            limit,
+            window_nanos,
+            now_mono,
+            now_unix,
+        ),
+        KeyState::SlidingWindow { timestamps } => {
+            sliding_window(timestamps, limit, window_nanos, now_mono, now_unix)
+        }
         KeyState::TokenBucket {
             tokens_milli,
             last_refill,
-        } => token_bucket(tokens_milli, last_refill, limit, window_nanos, now_mono, now_unix),
+        } => token_bucket(
+            tokens_milli,
+            last_refill,
+            limit,
+            window_nanos,
+            now_mono,
+            now_unix,
+        ),
     }
 }
 
@@ -535,7 +569,11 @@ mod tests {
         // Advance past the 1-hour staleness threshold and trigger sweep.
         let stale_time = T0 + super::TOKEN_BUCKET_STALE_NANOS + 1;
         store.sweep(stale_time);
-        assert_eq!(store.inner.read().len(), 0, "stale fixed window key must be evicted");
+        assert_eq!(
+            store.inner.read().len(),
+            0,
+            "stale fixed window key must be evicted"
+        );
     }
 
     #[test]
@@ -547,10 +585,20 @@ mod tests {
         assert_eq!(store.inner.read().len(), 1);
 
         // Access after window elapses — the per-access cutoff drains all timestamps.
-        check(&store, "sweep:sw", 3, Algorithm::SlidingWindow, T0 + WINDOW + 1);
+        check(
+            &store,
+            "sweep:sw",
+            3,
+            Algorithm::SlidingWindow,
+            T0 + WINDOW + 1,
+        );
         // Deque now has one fresh entry; sweep should keep it.
         store.sweep(T0 + WINDOW + 1);
-        assert_eq!(store.inner.read().len(), 1, "active sliding window key must be kept");
+        assert_eq!(
+            store.inner.read().len(),
+            1,
+            "active sliding window key must be kept"
+        );
 
         // Advance far enough that a sweep after window drain would evict.
         let far_future = T0 + WINDOW * 100;
@@ -558,7 +606,13 @@ mod tests {
         check(&store, "sweep:sw2", 1, Algorithm::SlidingWindow, T0);
         let after_window = T0 + WINDOW + 1;
         // This access drains T0, adds after_window.
-        check(&store, "sweep:sw2", 1, Algorithm::SlidingWindow, after_window);
+        check(
+            &store,
+            "sweep:sw2",
+            1,
+            Algorithm::SlidingWindow,
+            after_window,
+        );
         // Now advance far past, access to drain the deque with a blocked request.
         let _ = check(&store, "sweep:sw2", 1, Algorithm::SlidingWindow, far_future);
         // The above drains old entries and adds one new one; next access after that window:
@@ -591,7 +645,11 @@ mod tests {
 
         let stale_time = T0 + super::TOKEN_BUCKET_STALE_NANOS + 1;
         store.sweep(stale_time);
-        assert_eq!(store.inner.read().len(), 0, "stale token bucket key must be evicted");
+        assert_eq!(
+            store.inner.read().len(),
+            0,
+            "stale token bucket key must be evicted"
+        );
     }
 
     #[test]
@@ -600,6 +658,10 @@ mod tests {
         check(&store, "sweep:active", 10, Algorithm::FixedWindow, T0);
         // Sweep at a time within the staleness threshold — key should be kept.
         store.sweep(T0 + 1_000_000_000);
-        assert_eq!(store.inner.read().len(), 1, "active key must not be evicted");
+        assert_eq!(
+            store.inner.read().len(),
+            1,
+            "active key must not be evicted"
+        );
     }
 }

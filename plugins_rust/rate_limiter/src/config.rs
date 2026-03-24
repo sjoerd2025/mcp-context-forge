@@ -31,7 +31,9 @@ pub enum ConfigError {
     InvalidRateString(String),
     #[error("rate count must be > 0, got {0}")]
     ZeroCount(u64),
-    #[error("invalid algorithm {0:?}: expected \"fixed_window\", \"sliding_window\", or \"token_bucket\"")]
+    #[error(
+        "invalid algorithm {0:?}: expected \"fixed_window\", \"sliding_window\", or \"token_bucket\""
+    )]
     InvalidAlgorithm(String),
 }
 
