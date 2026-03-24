@@ -2322,9 +2322,12 @@ load-test-agentgateway-mcp-server-time:    ## Load test external MCP server (loc
 MCP_PROTOCOL_LOCUSTFILE ?= tests/loadtest/locustfile_mcp_protocol.py
 MCP_RATE_LIMITER_LOCUSTFILE ?= tests/loadtest/locustfile_rate_limiter_backend_correctness.py
 MCP_RATE_LIMITER_SCALE_LOCUSTFILE ?= tests/loadtest/locustfile_rate_limiter_scale.py
+MCP_RATE_LIMITER_REDIS_CAPACITY_LOCUSTFILE ?= tests/loadtest/locustfile_rate_limiter_redis_capacity.py
 RL_ALGORITHM ?= fixed_window
 RL_USERS ?= 100
 RL_SPAWN_RATE ?= 10
+RL_REQS_PER_SECOND ?= 0.25
+RL_PROMPT_ID ?=
 MCP_PROTOCOL_HOST ?= http://localhost:4444
 MCP_BENCHMARK_HOST ?= http://localhost:8080
 MCP_BENCHMARK_SERVER_ID ?= 9779b6698cbd4b4995ee04a4fab38737
@@ -2445,7 +2448,7 @@ benchmark-rate-limiter:                     ## Rate limiter correctness test (1 
 # help: benchmark-rate-limiter-scale  - Multi-user scale test showing Redis memory divergence across algorithms
 .PHONY: benchmark-rate-limiter-scale
 RL_RUN_TIME ?= 300s
-benchmark-rate-limiter-scale:               ## Scale test: 500 unique users, Redis memory timeline per algorithm
+benchmark-rate-limiter-scale:               ## Scale test: RL_USERS unique users (default 100), Redis memory timeline per algorithm
 	@echo "📈 Running rate limiter scale test (resource divergence)..."
 	@echo "   Algorithm: $(RL_ALGORITHM)  (must match plugins/config.yaml)"
 	@echo "   Users:     $(RL_USERS) unique identities  (each creates own Redis key)"
@@ -2474,6 +2477,36 @@ benchmark-rate-limiter-scale:               ## Scale test: 500 unique users, Red
 			--headless \
 			--only-summary \
 			ScaleComparisonUser || true'
+
+
+# help: benchmark-rate-limiter-redis-capacity  - Multi-instance prompt-path concurrency benchmark for Redis rate limiting
+.PHONY: benchmark-rate-limiter-redis-capacity
+benchmark-rate-limiter-redis-capacity:      ## Capacity test: 3 gateways + Redis on prompt_pre_fetch path
+	@echo "🚀 Running rate limiter Redis capacity test..."
+	@echo "   Host:        $(MCP_BENCHMARK_HOST)"
+	@echo "   Topology:    nginx -> 3 gateways -> shared Redis"
+	@echo "   Path:        REST /prompts/{id} (prompt_pre_fetch)"
+	@echo "   Users:       $(RL_USERS)"
+	@echo "   Spawn rate:  $(RL_SPAWN_RATE)/s"
+	@echo "   Pace:        $(RL_REQS_PER_SECOND) req/s per user"
+	@echo "   Duration:    $(RL_RUN_TIME)"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -eu -o pipefail -c 'source $(VENV_DIR)/bin/activate && \
+		LOCUST_LOG_LEVEL=ERROR \
+		RL_USERS=$(RL_USERS) \
+		RL_SPAWN_RATE=$(RL_SPAWN_RATE) \
+		RL_RUN_TIME=$(RL_RUN_TIME) \
+		RL_REQS_PER_SECOND=$(RL_REQS_PER_SECOND) \
+		RL_LIMIT_PER_MIN=$(RL_LIMIT_PER_MIN) \
+		RL_PROMPT_ID=$(RL_PROMPT_ID) \
+		locust -f $(MCP_RATE_LIMITER_REDIS_CAPACITY_LOCUSTFILE) \
+			--host=$(MCP_BENCHMARK_HOST) \
+			--users=$(RL_USERS) \
+			--spawn-rate=$(RL_SPAWN_RATE) \
+			--run-time=$(RL_RUN_TIME) \
+			--headless \
+			--only-summary \
+			CapacityPromptUser || true'
 
 .PHONY: benchmark-mcp-mixed-300
 benchmark-mcp-mixed-300:                    ## Distributed 300-user mixed MCP benchmark

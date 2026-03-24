@@ -424,8 +424,7 @@ class RateLimitedUser(FastHttpUser):
         A single tools/call request is sent. The Locust stat name is set based on
         the semantic outcome — no second request is fired:
           - 'MCP tools/call [allowed]'      — gateway processed the call normally
-          - 'MCP tools/call [rate-limited]' — MCP result.isError is set; includes plugin rate-limit blocks
-                                              and other tool errors — the two cannot be distinguished here
+          - 'MCP tools/call [rate-limited]' — HTTP 429 or MCP result.isError (plugin rate-limit block)
           - 'MCP tools/call [infra-error]'  — HTTP error or malformed response
 
         Rate-limited responses are recorded as success() so they do not inflate
@@ -458,6 +457,10 @@ class RateLimitedUser(FastHttpUser):
                 if sid:
                     self._mcp_session_id = sid
 
+                if response.status_code == 429:
+                    response.request_meta["name"] = "MCP tools/call [rate-limited]"
+                    response.success()
+                    return
                 if response.status_code in (502, 503, 504):
                     response.request_meta["name"] = "MCP tools/call [infra-error]"
                     response.failure(f"Infrastructure error: {response.status_code}")
