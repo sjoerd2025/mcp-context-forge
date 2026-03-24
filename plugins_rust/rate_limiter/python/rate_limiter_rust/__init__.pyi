@@ -117,3 +117,16 @@ class RateLimiterEngine:
         Intended for Redis-backed deployments so Python async hooks can await
         the Rust Redis path without blocking the event loop.
         """
+    def check(self, user: builtins.str, tenant: typing.Optional[builtins.str], tool: builtins.str, now_unix: builtins.int, include_retry_after: builtins.bool) -> tuple[builtins.bool, builtins.dict[builtins.str, builtins.str], builtins.dict[builtins.str, typing.Any]]:
+        r"""
+        High-level check: builds dimension keys internally, evaluates, and
+        returns pre-built Python dicts for headers and metadata.
+
+        Returns ``(allowed, headers_dict, meta_dict)``.
+        """
+    def check_async(self, user: builtins.str, tenant: typing.Optional[builtins.str], tool: builtins.str, now_unix: builtins.int, include_retry_after: builtins.bool) -> typing.Any:
+        r"""
+        Async variant of ``check()`` for Redis-backed deployments.
+
+        Returns an awaitable that resolves to ``(allowed, headers_dict, meta_dict)``.
+        """

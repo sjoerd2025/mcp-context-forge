@@ -2328,6 +2328,7 @@ RL_USERS ?= 100
 RL_SPAWN_RATE ?= 10
 RL_REQS_PER_SECOND ?= 0.25
 RL_PROMPT_ID ?=
+RATE_LIMITER_FORCE_PYTHON ?=
 MCP_PROTOCOL_HOST ?= http://localhost:4444
 MCP_BENCHMARK_HOST ?= http://localhost:8080
 MCP_BENCHMARK_SERVER_ID ?= 9779b6698cbd4b4995ee04a4fab38737
@@ -2493,6 +2494,7 @@ benchmark-rate-limiter-redis-capacity:      ## Capacity test: 3 gateways + Redis
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -eu -o pipefail -c 'source $(VENV_DIR)/bin/activate && \
 		LOCUST_LOG_LEVEL=ERROR \
+		RATE_LIMITER_FORCE_PYTHON=$(RATE_LIMITER_FORCE_PYTHON) \
 		RL_USERS=$(RL_USERS) \
 		RL_SPAWN_RATE=$(RL_SPAWN_RATE) \
 		RL_RUN_TIME=$(RL_RUN_TIME) \
@@ -2507,6 +2509,16 @@ benchmark-rate-limiter-redis-capacity:      ## Capacity test: 3 gateways + Redis
 			--headless \
 			--only-summary \
 			CapacityPromptUser || true'
+
+# help: benchmark-rate-limiter-capacity-rust  - Capacity test with Rust engine enabled (default)
+.PHONY: benchmark-rate-limiter-capacity-rust
+benchmark-rate-limiter-capacity-rust:       ## Capacity test with Rust engine
+	RATE_LIMITER_FORCE_PYTHON=0 $(MAKE) benchmark-rate-limiter-redis-capacity
+
+# help: benchmark-rate-limiter-capacity-python  - Capacity test with Python fallback (forced)
+.PHONY: benchmark-rate-limiter-capacity-python
+benchmark-rate-limiter-capacity-python:     ## Capacity test with Python fallback
+	RATE_LIMITER_FORCE_PYTHON=1 $(MAKE) benchmark-rate-limiter-redis-capacity
 
 .PHONY: benchmark-mcp-mixed-300
 benchmark-mcp-mixed-300:                    ## Distributed 300-user mixed MCP benchmark

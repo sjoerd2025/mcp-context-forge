@@ -117,72 +117,72 @@ impl MemoryStore {
         now_mono: Nanos,
         now_unix: UnixSecs,
     ) -> DimResult {
-        // Ensure the key entry exists (write lock on outer map only if missing).
-        {
-            let read = self.inner.read();
-            if !read.contains_key(key) {
-                drop(read);
-                let mut write = self.inner.write();
-                write.entry(key.to_string()).or_insert_with(|| {
-                    RwLock::new(match algorithm {
-                        Algorithm::FixedWindow => KeyState::FixedWindow {
-                            count: 0,
-                            window_start: now_mono,
-                            window_start_unix: now_unix,
-                        },
-                        Algorithm::SlidingWindow => KeyState::SlidingWindow {
-                            timestamps: VecDeque::new(),
-                        },
-                        Algorithm::TokenBucket => KeyState::TokenBucket {
-                            tokens_milli: limit.saturating_mul(1000),
-                            last_refill: now_mono,
-                        },
-                    })
-                });
-            }
-        }
-
+        // Fast path: key already exists — single read lock on outer map.
         let result = {
             let read = self.inner.read();
-            let key_lock = read.get(key).unwrap();
-            let mut state = key_lock.write();
-
-            match &mut *state {
-                KeyState::FixedWindow {
-                    count,
-                    window_start,
-                    window_start_unix,
-                } => fixed_window(
-                    count,
-                    window_start,
-                    window_start_unix,
-                    limit,
-                    window_nanos,
-                    now_mono,
-                    now_unix,
-                ),
-                KeyState::SlidingWindow { timestamps } => {
-                    sliding_window(timestamps, limit, window_nanos, now_mono, now_unix)
-                }
-                KeyState::TokenBucket {
-                    tokens_milli,
-                    last_refill,
-                } => token_bucket(
-                    tokens_milli,
-                    last_refill,
-                    limit,
-                    window_nanos,
-                    now_mono,
-                    now_unix,
-                ),
+            if let Some(key_lock) = read.get(key) {
+                let mut state = key_lock.write();
+                Some(evaluate_state(&mut state, limit, window_nanos, now_mono, now_unix))
+            } else {
+                None
             }
         };
+
+        let result = result.unwrap_or_else(|| {
+            // Slow path: key missing — write lock to insert, then evaluate.
+            // Only runs on first access per key; steady-state always hits fast path.
+            let mut write = self.inner.write();
+            let key_lock = write.entry(key.to_string()).or_insert_with(|| {
+                RwLock::new(new_key_state(algorithm, limit, now_mono, now_unix))
+            });
+            let mut state = key_lock.write();
+            evaluate_state(&mut state, limit, window_nanos, now_mono, now_unix)
+        });
+
         // All locks dropped — amortized sweep (MEM-06).
         let n = self.call_count.fetch_add(1, Ordering::Relaxed);
         if n & (SWEEP_INTERVAL - 1) == 0 && n > 0 {
             self.sweep(now_mono);
         }
         result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Create the initial key state for a new rate-limit key.
+fn new_key_state(algorithm: Algorithm, limit: u64, now_mono: Nanos, now_unix: UnixSecs) -> KeyState {
+    match algorithm {
+        Algorithm::FixedWindow => KeyState::FixedWindow {
+            count: 0,
+            window_start: now_mono,
+            window_start_unix: now_unix,
+        },
+        Algorithm::SlidingWindow => KeyState::SlidingWindow {
+            timestamps: VecDeque::new(),
+        },
+        Algorithm::TokenBucket => KeyState::TokenBucket {
+            tokens_milli: limit.saturating_mul(1000),
+            last_refill: now_mono,
+        },
+    }
+}
+
+/// Dispatch to the correct algorithm based on the key state variant.
+fn evaluate_state(state: &mut KeyState, limit: u64, window_nanos: u64, now_mono: Nanos, now_unix: UnixSecs) -> DimResult {
+    match state {
+        KeyState::FixedWindow {
+            count,
+            window_start,
+            window_start_unix,
+        } => fixed_window(count, window_start, window_start_unix, limit, window_nanos, now_mono, now_unix),
+        KeyState::SlidingWindow { timestamps } => sliding_window(timestamps, limit, window_nanos, now_mono, now_unix),
+        KeyState::TokenBucket {
+            tokens_milli,
+            last_refill,
+        } => token_bucket(tokens_milli, last_refill, limit, window_nanos, now_mono, now_unix),
     }
 }
 

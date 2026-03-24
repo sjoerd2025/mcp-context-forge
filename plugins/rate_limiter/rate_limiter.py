@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
@@ -56,12 +57,17 @@ logger = logging.getLogger(__name__)
 # Optional Rust engine (ARCH-05: Python backend is the fallback when unavailable)
 # ---------------------------------------------------------------------------
 
-try:
-    from rate_limiter_rust.rate_limiter_rust import RateLimiterEngine as _RateLimiterEngine  # type: ignore[import]
+_RATE_LIMITER_FORCE_PYTHON = os.environ.get("RATE_LIMITER_FORCE_PYTHON", "").strip().lower() in ("1", "true", "yes")
 
-    _RUST_AVAILABLE = True
-except ImportError:
+if _RATE_LIMITER_FORCE_PYTHON:
     _RUST_AVAILABLE = False
+else:
+    try:
+        from rate_limiter_rust.rate_limiter_rust import RateLimiterEngine as _RateLimiterEngine  # type: ignore[import]
+
+        _RUST_AVAILABLE = True
+    except ImportError:
+        _RUST_AVAILABLE = False
 
 
 class RustRateLimiterEngine:
@@ -84,6 +90,18 @@ class RustRateLimiterEngine:
     async def evaluate_many_async(self, checks: List[Tuple[str, int, int]], now_unix: int) -> Any:
         """Delegate to the PyO3 async engine for Redis-backed calls."""
         return await self._engine.evaluate_many_async(checks, now_unix)
+
+    def check(self, user: str, tenant: Optional[str], tool: str, now_unix: int, include_retry_after: bool) -> Tuple[bool, dict, dict]:
+        """High-level check: returns (allowed, headers_dict, meta_dict).
+
+        Builds dimension keys internally, evaluates, and returns pre-built
+        dicts — eliminates per-attribute PyO3 boundary crossings.
+        """
+        return self._engine.check(user, tenant, tool, now_unix, include_retry_after)
+
+    async def check_async(self, user: str, tenant: Optional[str], tool: str, now_unix: int, include_retry_after: bool) -> Tuple[bool, dict, dict]:
+        """Async variant of check() for Redis-backed deployments."""
+        return await self._engine.check_async(user, tenant, tool, now_unix, include_retry_after)
 
 
 # ---------------------------------------------------------------------------
@@ -1133,17 +1151,15 @@ class RateLimiterPlugin(Plugin):
             user = _extract_user_identity(context.global_context.user)
             tenant = str(context.global_context.tenant_id).strip() if context.global_context.tenant_id else None
 
-            # Rust fast-path: one PyO3 call for all active dimensions (ARCH-01).
+            # Rust fast-path: single PyO3 call builds keys, evaluates, and
+            # returns pre-built headers/meta dicts (ARCH-01).
             if self._rust_engine is not None:
-                checks = self._build_rust_checks(user, tenant, prompt)
-                if not checks:
-                    return PromptPrehookResult(metadata={"limited": False})
                 try:
                     now_unix = int(time.time())
                     if self._should_use_async_rust_redis():
-                        result = await self._rust_engine.evaluate_many_async(checks, now_unix)
+                        allowed, headers, meta = await self._rust_engine.check_async(user, tenant, prompt, now_unix, True)
                     else:
-                        result = self._rust_engine.evaluate_many(checks, now_unix)  # single call (ARCH-01)
+                        allowed, headers, meta = self._rust_engine.check(user, tenant, prompt, now_unix, True)
                 except Exception:
                     if self._should_fallback_to_python_redis():
                         logger.warning(
@@ -1153,9 +1169,9 @@ class RateLimiterPlugin(Plugin):
                     else:
                         raise
                 else:
-                    meta = self._rust_to_plugin_meta(result)
-                    if not result.allowed:
-                        headers = self._rust_to_plugin_headers(result, include_retry_after=True)
+                    if meta.get("limited") is False:
+                        return PromptPrehookResult(metadata=meta)
+                    if not allowed:
                         return PromptPrehookResult(
                             continue_processing=False,
                             violation=PluginViolation(
@@ -1167,7 +1183,8 @@ class RateLimiterPlugin(Plugin):
                                 http_headers=headers,
                             ),
                         )
-                    headers = self._rust_to_plugin_headers(result, include_retry_after=False)
+                    # Allowed — strip Retry-After from headers (only sent on violations).
+                    headers.pop("Retry-After", None)
                     return PromptPrehookResult(metadata=meta, http_headers=headers)
 
             # Python path (ARCH-05: fallback when Rust engine unavailable).
@@ -1224,17 +1241,15 @@ class RateLimiterPlugin(Plugin):
             user = _extract_user_identity(context.global_context.user)
             tenant = str(context.global_context.tenant_id).strip() if context.global_context.tenant_id else None
 
-            # Rust fast-path: one PyO3 call for all active dimensions (ARCH-01).
+            # Rust fast-path: single PyO3 call builds keys, evaluates, and
+            # returns pre-built headers/meta dicts (ARCH-01).
             if self._rust_engine is not None:
-                checks = self._build_rust_checks(user, tenant, tool)
-                if not checks:
-                    return ToolPreInvokeResult(metadata={"limited": False})
                 try:
                     now_unix = int(time.time())
                     if self._should_use_async_rust_redis():
-                        result = await self._rust_engine.evaluate_many_async(checks, now_unix)
+                        allowed, headers, meta = await self._rust_engine.check_async(user, tenant, tool, now_unix, True)
                     else:
-                        result = self._rust_engine.evaluate_many(checks, now_unix)  # single call (ARCH-01)
+                        allowed, headers, meta = self._rust_engine.check(user, tenant, tool, now_unix, True)
                 except Exception:
                     if self._should_fallback_to_python_redis():
                         logger.warning(
@@ -1244,9 +1259,9 @@ class RateLimiterPlugin(Plugin):
                     else:
                         raise
                 else:
-                    meta = self._rust_to_plugin_meta(result)
-                    if not result.allowed:
-                        headers = self._rust_to_plugin_headers(result, include_retry_after=True)
+                    if meta.get("limited") is False:
+                        return ToolPreInvokeResult(metadata=meta)
+                    if not allowed:
                         return ToolPreInvokeResult(
                             continue_processing=False,
                             violation=PluginViolation(
@@ -1258,7 +1273,8 @@ class RateLimiterPlugin(Plugin):
                                 http_headers=headers,
                             ),
                         )
-                    headers = self._rust_to_plugin_headers(result, include_retry_after=False)
+                    # Allowed — strip Retry-After from headers (only sent on violations).
+                    headers.pop("Retry-After", None)
                     return ToolPreInvokeResult(metadata=meta, http_headers=headers)
 
             # Python path (ARCH-05: fallback when Rust engine unavailable).

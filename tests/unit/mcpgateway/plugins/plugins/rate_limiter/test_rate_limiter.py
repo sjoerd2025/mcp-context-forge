@@ -2994,9 +2994,9 @@ async def test_sliding_window_allow_after_sweep_starts_fresh():
 # Rust engine architecture tests
 # ---------------------------------------------------------------------------
 # These tests assert the Python↔Rust seam properties required by the spec:
-#   ARCH-01  evaluate_many() called exactly once per hook invocation
+#   ARCH-01  check()/check_async() called exactly once per hook invocation
 #   ARCH-03  Python wrapper contains no rate math (structural — the wrapper
-#            only builds the checks list and converts EvalResult to headers)
+#            delegates to check() which returns (allowed, headers, meta))
 #   ARCH-04  Rust engine error / exception → fail-open (request allowed)
 #   ARCH-05  _RUST_AVAILABLE = False path exercises the Python backend
 # ---------------------------------------------------------------------------
@@ -3029,7 +3029,7 @@ _skip_no_rust = pytest.mark.skipif(not _RUST_ENGINE_PRESENT, reason="Rust engine
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch01_evaluate_many_called_once_per_tool_hook():
-    """ARCH-01: Python wrapper makes exactly one evaluate_many() call per hook.
+    """ARCH-01: Python wrapper makes exactly one check() call per hook.
 
     The seam between Python and Rust must be a single PyO3 call regardless of
     how many active dimensions (user, tenant, tool) the request touches.
@@ -3041,33 +3041,32 @@ async def test_arch01_evaluate_many_called_once_per_tool_hook():
     ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice", tenant_id="acme"))
     payload = ToolPreInvokePayload(name="test_tool", arguments={})
 
-    with patch.object(plugin._rust_engine, "evaluate_many", wraps=plugin._rust_engine.evaluate_many) as mock_em:
+    with patch.object(plugin._rust_engine, "check", wraps=plugin._rust_engine.check) as mock_check:
         await plugin.tool_pre_invoke(payload, ctx)
-        assert mock_em.call_count == 1, (
-            f"evaluate_many() must be called exactly once per hook invocation, "
-            f"got {mock_em.call_count}"
+        assert mock_check.call_count == 1, (
+            f"check() must be called exactly once per hook invocation, got {mock_check.call_count}"
         )
 
 
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch01_evaluate_many_called_once_per_prompt_hook():
-    """ARCH-01: Same single-call guarantee for prompt_pre_fetch."""
+    """ARCH-01: Same single-call guarantee for prompt_pre_fetch via check()."""
     plugin = _mk_rust("10/s")
     assert plugin._rust_engine is not None
 
     ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
     payload = PromptPrehookPayload(prompt_id="my_prompt")
 
-    with patch.object(plugin._rust_engine, "evaluate_many", wraps=plugin._rust_engine.evaluate_many) as mock_em:
+    with patch.object(plugin._rust_engine, "check", wraps=plugin._rust_engine.check) as mock_check:
         await plugin.prompt_pre_fetch(payload, ctx)
-        assert mock_em.call_count == 1
+        assert mock_check.call_count == 1
 
 
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch01_redis_rust_path_uses_async_entrypoint():
-    """Redis-backed Rust path should await evaluate_many_async exactly once."""
+    """Redis-backed Rust path should await check_async exactly once."""
     from unittest.mock import AsyncMock  # noqa: PLC0415
 
     plugin = RateLimiterPlugin(
@@ -3084,8 +3083,8 @@ async def test_arch01_redis_rust_path_uses_async_entrypoint():
     ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
     payload = ToolPreInvokePayload(name="search", arguments={})
 
-    sync_mock = patch.object(plugin._rust_engine, "evaluate_many", wraps=plugin._rust_engine.evaluate_many)
-    async_mock = patch.object(plugin._rust_engine, "evaluate_many_async", AsyncMock(wraps=plugin._rust_engine.evaluate_many_async))
+    sync_mock = patch.object(plugin._rust_engine, "check", wraps=plugin._rust_engine.check)
+    async_mock = patch.object(plugin._rust_engine, "check_async", AsyncMock(wraps=plugin._rust_engine.check_async))
     with sync_mock as mock_sync, async_mock as mock_async:
         await plugin.tool_pre_invoke(payload, ctx)
         assert mock_async.await_count == 1
@@ -3095,7 +3094,7 @@ async def test_arch01_redis_rust_path_uses_async_entrypoint():
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch01_memory_rust_path_keeps_sync_entrypoint():
-    """Memory-backed Rust path should continue using the sync evaluate_many entrypoint."""
+    """Memory-backed Rust path should continue using the sync check entrypoint."""
     from unittest.mock import AsyncMock  # noqa: PLC0415
 
     plugin = _mk_rust("10/s")
@@ -3104,8 +3103,8 @@ async def test_arch01_memory_rust_path_keeps_sync_entrypoint():
     ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
     payload = ToolPreInvokePayload(name="search", arguments={})
 
-    sync_mock = patch.object(plugin._rust_engine, "evaluate_many", wraps=plugin._rust_engine.evaluate_many)
-    async_mock = patch.object(plugin._rust_engine, "evaluate_many_async", AsyncMock(wraps=plugin._rust_engine.evaluate_many_async))
+    sync_mock = patch.object(plugin._rust_engine, "check", wraps=plugin._rust_engine.check)
+    async_mock = patch.object(plugin._rust_engine, "check_async", AsyncMock(wraps=plugin._rust_engine.check_async))
     with sync_mock as mock_sync, async_mock as mock_async:
         await plugin.tool_pre_invoke(payload, ctx)
         assert mock_sync.call_count == 1
@@ -3115,10 +3114,11 @@ async def test_arch01_memory_rust_path_keeps_sync_entrypoint():
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch01_single_call_covers_all_active_dimensions():
-    """ARCH-01: The single evaluate_many() call receives all active dimensions.
+    """ARCH-01: The single check() call receives all active dimensions.
 
-    When user + tenant + tool are all configured, the checks list passed to
-    evaluate_many() must contain all three — not split across multiple calls.
+    When user + tenant + tool are all configured, check() receives them as
+    separate arguments and builds the checks internally — not split across
+    multiple calls.
     """
     plugin = RateLimiterPlugin(
         PluginConfig(
@@ -3139,51 +3139,28 @@ async def test_arch01_single_call_covers_all_active_dimensions():
     ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice", tenant_id="acme"))
     payload = ToolPreInvokePayload(name="search", arguments={})
 
-    with patch.object(plugin._rust_engine, "evaluate_many", wraps=plugin._rust_engine.evaluate_many) as mock_em:
+    with patch.object(plugin._rust_engine, "check", wraps=plugin._rust_engine.check) as mock_check:
         await plugin.tool_pre_invoke(payload, ctx)
-        assert mock_em.call_count == 1
-        checks_passed = mock_em.call_args[0][0]  # first positional arg
-        assert len(checks_passed) == 3, (
-            f"All three dimensions (user, tenant, tool) must be in the single "
-            f"evaluate_many() call; got {len(checks_passed)} checks: {checks_passed}"
-        )
-        keys = [c[0] for c in checks_passed]
-        assert any(k.startswith("user:") for k in keys)
-        assert any(k.startswith("tenant:") for k in keys)
-        assert any(k.startswith("tool:") for k in keys)
+        assert mock_check.call_count == 1
+        # check() receives (user, tenant, tool, now_unix, include_retry_after)
+        args = mock_check.call_args[0]
+        assert args[0] == "alice", f"user must be passed; got {args[0]}"
+        assert args[1] == "acme", f"tenant must be passed; got {args[1]}"
+        assert args[2] == "search", f"tool must be passed; got {args[2]}"
 
 
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch02_rust_tool_success_preserves_metadata_shape():
-    """Rust fast path should preserve success metadata on the Python wrapper contract."""
+    """Rust fast path should preserve success metadata on the Python wrapper contract.
+
+    The check() API returns (allowed, headers, meta) directly; the Python
+    wrapper passes meta through as-is.
+    """
     plugin = _mk_rust("10/s")
     assert plugin._rust_engine is not None
 
-    class _FakeDim:
-        def __init__(self, remaining: int, reset_timestamp: int):
-            self.remaining = remaining
-            self.reset_timestamp = reset_timestamp
-            self.retry_after = None
-
-    class _FakeEvalResult:
-        allowed = True
-        limit = 10
-        remaining = 7
-        reset_timestamp = 1_700_000_060
-        retry_after = None
-        violated_dimensions = []
-        allowed_dimensions = [_FakeDim(9, 1_700_000_060), _FakeDim(7, 1_700_000_060)]
-
-    ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
-    payload = ToolPreInvokePayload(name="search", arguments={})
-
-    with patch("plugins.rate_limiter.rate_limiter.time.time", return_value=1_700_000_000):
-        with patch.object(plugin._rust_engine, "evaluate_many", return_value=_FakeEvalResult()):
-            result = await plugin.tool_pre_invoke(payload, ctx)
-
-    assert result.violation is None
-    assert result.metadata == {
+    fake_meta = {
         "limited": True,
         "remaining": 7,
         "reset_in": 60,
@@ -3194,39 +3171,35 @@ async def test_arch02_rust_tool_success_preserves_metadata_shape():
             ]
         },
     }
+    fake_headers = {
+        "X-RateLimit-Limit": "10",
+        "X-RateLimit-Remaining": "7",
+        "X-RateLimit-Reset": "1700000060",
+        "Retry-After": "0",
+    }
+
+    ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+    payload = ToolPreInvokePayload(name="search", arguments={})
+
+    with patch.object(plugin._rust_engine, "check", return_value=(True, fake_headers, fake_meta)):
+        result = await plugin.tool_pre_invoke(payload, ctx)
+
+    assert result.violation is None
+    assert result.metadata == fake_meta
 
 
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch02_rust_prompt_block_preserves_details_shape():
-    """Rust fast path should preserve blocked details on the Python wrapper contract."""
+    """Rust fast path should preserve blocked details on the Python wrapper contract.
+
+    The check() API returns (allowed, headers, meta) directly; on a block the
+    Python wrapper uses meta as violation.details.
+    """
     plugin = _mk_rust("1/s")
     assert plugin._rust_engine is not None
 
-    class _FakeDim:
-        def __init__(self, remaining: int, reset_timestamp: int, retry_after: int | None):
-            self.remaining = remaining
-            self.reset_timestamp = reset_timestamp
-            self.retry_after = retry_after
-
-    class _FakeEvalResult:
-        allowed = False
-        limit = 1
-        remaining = 0
-        reset_timestamp = 1_700_000_030
-        retry_after = 30
-        violated_dimensions = [_FakeDim(0, 1_700_000_030, 30)]
-        allowed_dimensions = [_FakeDim(8, 1_700_000_060, None)]
-
-    ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
-    payload = PromptPrehookPayload(prompt_id="search")
-
-    with patch("plugins.rate_limiter.rate_limiter.time.time", return_value=1_700_000_000):
-        with patch.object(plugin._rust_engine, "evaluate_many", return_value=_FakeEvalResult()):
-            result = await plugin.prompt_pre_fetch(payload, ctx)
-
-    assert result.violation is not None
-    assert result.violation.details == {
+    fake_meta = {
         "limited": True,
         "remaining": 0,
         "reset_in": 30,
@@ -3235,6 +3208,21 @@ async def test_arch02_rust_prompt_block_preserves_details_shape():
             "allowed": [{"limited": True, "remaining": 8, "reset_in": 60}],
         },
     }
+    fake_headers = {
+        "X-RateLimit-Limit": "1",
+        "X-RateLimit-Remaining": "0",
+        "X-RateLimit-Reset": "1700000030",
+        "Retry-After": "30",
+    }
+
+    ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+    payload = PromptPrehookPayload(prompt_id="search")
+
+    with patch.object(plugin._rust_engine, "check", return_value=(False, fake_headers, fake_meta)):
+        result = await plugin.prompt_pre_fetch(payload, ctx)
+
+    assert result.violation is not None
+    assert result.violation.details == fake_meta
 
 
 @_skip_no_rust
@@ -3242,7 +3230,7 @@ async def test_arch02_rust_prompt_block_preserves_details_shape():
 async def test_arch04_rust_exception_is_fail_open():
     """ARCH-04: Rust engine exception → request is allowed (fail-open).
 
-    The fail-open policy lives in Python, not Rust. If evaluate_many() raises
+    The fail-open policy lives in Python, not Rust. If check() raises
     any exception, the hook must return an allow result — never block the caller.
     """
     plugin = _mk_rust("10/s")
@@ -3252,7 +3240,7 @@ async def test_arch04_rust_exception_is_fail_open():
     ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
     payload = ToolPreInvokePayload(name="test_tool", arguments={})
 
-    with patch.object(plugin._rust_engine, "evaluate_many", side_effect=RuntimeError("simulated Rust panic")):
+    with patch.object(plugin._rust_engine, "check", side_effect=RuntimeError("simulated Rust panic")):
         result = await plugin.tool_pre_invoke(payload, ctx)
 
     assert result.violation is None, (
@@ -3265,7 +3253,7 @@ async def test_arch04_rust_exception_is_fail_open():
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch04_rust_exception_fail_open_prompt_hook():
-    """ARCH-04: Same fail-open guarantee for prompt_pre_fetch."""
+    """ARCH-04: Same fail-open guarantee for prompt_pre_fetch via check()."""
     plugin = _mk_rust("10/s")
     if plugin._rust_engine is None:
         pytest.skip("Rust engine not active")
@@ -3273,7 +3261,7 @@ async def test_arch04_rust_exception_fail_open_prompt_hook():
     ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
     payload = PromptPrehookPayload(prompt_id="my_prompt")
 
-    with patch.object(plugin._rust_engine, "evaluate_many", side_effect=RuntimeError("simulated Rust panic")):
+    with patch.object(plugin._rust_engine, "check", side_effect=RuntimeError("simulated Rust panic")):
         result = await plugin.prompt_pre_fetch(payload, ctx)
 
     assert result.violation is None
@@ -3313,7 +3301,7 @@ async def test_arch04_rust_redis_exception_uses_python_fallback_when_enabled():
 
     with patch.object(
         plugin._rust_engine,
-        "evaluate_many_async",
+        "check_async",
         AsyncMock(side_effect=RuntimeError("simulated Rust panic")),
     ):
         r1 = await plugin.tool_pre_invoke(payload, ctx)
@@ -3348,7 +3336,7 @@ async def test_arch04_rust_redis_exception_fail_open_when_fallback_disabled():
 
     with patch.object(
         plugin._rust_engine,
-        "evaluate_many_async",
+        "check_async",
         AsyncMock(side_effect=RuntimeError("simulated Rust panic")),
     ):
         result = await plugin.tool_pre_invoke(payload, ctx)
@@ -3727,6 +3715,98 @@ def test_corr01_remaining_count_parity_fixed_window():
     assert py_remaining == rs_remaining, (
         f"remaining mismatch after {n_requests} requests: Python={py_remaining} Rust={rs_remaining}"
     )
+
+
+@_skip_no_rust
+@pytest.mark.parametrize("algorithm", [ALGORITHM_SLIDING_WINDOW, ALGORITHM_TOKEN_BUCKET])
+def test_corr01_remaining_count_parity_all_algorithms(algorithm):
+    """CORR-01: remaining count matches between Python and Rust for all algorithms."""
+    from plugins.rate_limiter.rate_limiter import FixedWindowAlgorithm, MemoryBackend, RustRateLimiterEngine, SlidingWindowAlgorithm, TokenBucketAlgorithm  # noqa: PLC0415
+
+    algo_map = {
+        ALGORITHM_FIXED_WINDOW: FixedWindowAlgorithm,
+        ALGORITHM_SLIDING_WINDOW: SlidingWindowAlgorithm,
+        ALGORITHM_TOKEN_BUCKET: TokenBucketAlgorithm,
+    }
+    limit = 10
+    window_nanos = 3600 * 1_000_000_000
+    now_unix = int(time.time())
+    n_requests = 4
+
+    py_backend = MemoryBackend(algorithm=algo_map[algorithm]())
+    rust_engine = RustRateLimiterEngine({"by_user": f"{limit}/h", "algorithm": algorithm})
+
+    async def _py_remaining() -> int:
+        remaining = 0
+        for _ in range(n_requests):
+            _, _, _, meta = await py_backend.allow("user:test", f"{limit}/h")
+            remaining = meta.get("remaining", 0)
+        return remaining
+
+    py_remaining = asyncio.run(_py_remaining())
+    rs_result = None
+    for _ in range(n_requests):
+        rs_result = rust_engine.evaluate_many([("user:test", limit, window_nanos)], now_unix)
+    rs_remaining = rs_result.remaining
+
+    assert py_remaining == rs_remaining, (
+        f"remaining mismatch ({algorithm}) after {n_requests} requests: Python={py_remaining} Rust={rs_remaining}"
+    )
+
+
+@_skip_no_rust
+def test_corr01_multi_dimension_parity():
+    """CORR-01: Rust check() with 3 dimensions produces the same allow/block sequence as Python."""
+    plugin_py = RateLimiterPlugin(
+        PluginConfig(
+            name="rl-parity-py",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=[ToolHookType.TOOL_PRE_INVOKE],
+            config={
+                "by_user": "5/h",
+                "by_tenant": "10/h",
+                "by_tool": {"test_tool": "3/h"},
+                "algorithm": ALGORITHM_FIXED_WINDOW,
+            },
+        )
+    )
+    plugin_py._rust_engine = None  # force Python path
+
+    plugin_rs = RateLimiterPlugin(
+        PluginConfig(
+            name="rl-parity-rs",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=[ToolHookType.TOOL_PRE_INVOKE],
+            config={
+                "by_user": "5/h",
+                "by_tenant": "10/h",
+                "by_tool": {"test_tool": "3/h"},
+                "algorithm": ALGORITHM_FIXED_WINDOW,
+            },
+        )
+    )
+    if plugin_rs._rust_engine is None:
+        pytest.skip("Rust engine not active")
+
+    payload = ToolPreInvokePayload(name="test_tool", arguments={})
+    py_sequence: list[bool] = []
+    rs_sequence: list[bool] = []
+
+    async def _run():
+        # Tool limit is 3/h — requests 4+ should be blocked by the tool dimension
+        for i in range(6):
+            ctx = PluginContext(global_context=GlobalContext(request_id=f"parity-{i}", user="alice@example.com", tenant_id="acme"))
+            py_result = await plugin_py.tool_pre_invoke(payload, ctx)
+            rs_result = await plugin_rs.tool_pre_invoke(payload, ctx)
+            py_sequence.append(py_result.continue_processing)
+            rs_sequence.append(rs_result.continue_processing)
+
+    asyncio.run(_run())
+    assert py_sequence == rs_sequence, (
+        f"Multi-dimension parity failure: Python={py_sequence} Rust={rs_sequence}"
+    )
+    # First 3 allowed (tool limit), then 3 blocked
+    assert py_sequence == [True, True, True, False, False, False]
 
 
 # ---------------------------------------------------------------------------
@@ -4184,7 +4264,7 @@ def test_extract_user_identity_dict_no_keys_is_anonymous():
 @_skip_no_rust
 @pytest.mark.asyncio
 async def test_arch01_redis_rust_prompt_uses_async_entrypoint():
-    """Redis-backed Rust path should await evaluate_many_async for prompt_pre_fetch."""
+    """Redis-backed Rust path should await check_async for prompt_pre_fetch."""
     from unittest.mock import AsyncMock  # noqa: PLC0415
 
     plugin = RateLimiterPlugin(
@@ -4201,8 +4281,8 @@ async def test_arch01_redis_rust_prompt_uses_async_entrypoint():
     ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
     payload = PromptPrehookPayload(prompt_id="search")
 
-    sync_mock = patch.object(plugin._rust_engine, "evaluate_many", wraps=plugin._rust_engine.evaluate_many)
-    async_mock = patch.object(plugin._rust_engine, "evaluate_many_async", AsyncMock(wraps=plugin._rust_engine.evaluate_many_async))
+    sync_mock = patch.object(plugin._rust_engine, "check", wraps=plugin._rust_engine.check)
+    async_mock = patch.object(plugin._rust_engine, "check_async", AsyncMock(wraps=plugin._rust_engine.check_async))
     with sync_mock as mock_sync, async_mock as mock_async:
         await plugin.prompt_pre_fetch(payload, ctx)
         assert mock_async.await_count == 1, "prompt_pre_fetch must use async entrypoint for Redis"

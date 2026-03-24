@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
+
 use pyo3_stub_gen::derive::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
@@ -228,6 +229,223 @@ impl RateLimiterEngine {
             Python::attach(|py| Py::new(py, EvalResult::from_dims(&dim_results)))
         })
     }
+
+    /// High-level check: builds dimension keys internally, evaluates, and
+    /// returns pre-built Python dicts for headers and metadata.
+    ///
+    /// This eliminates all per-attribute PyO3 accesses on the Python side.
+    /// The Python wrapper calls this once per hook invocation instead of
+    /// `evaluate_many()` + `_rust_to_plugin_meta()` + `_rust_to_plugin_headers()`.
+    ///
+    /// Returns `(allowed, headers_dict, meta_dict)`.
+    pub fn check<'py>(
+        &self,
+        py: Python<'py>,
+        user: &str,
+        tenant: Option<&str>,
+        tool: &str,
+        now_unix: i64,
+        include_retry_after: bool,
+    ) -> PyResult<(bool, Bound<'py, PyDict>, Bound<'py, PyDict>)> {
+        let checks = self.build_checks(user, tenant, tool);
+        if checks.is_empty() {
+            let headers = PyDict::new(py);
+            let meta = PyDict::new(py);
+            meta.set_item("limited", false)?;
+            return Ok((true, headers, meta));
+        }
+
+        let dim_results: Vec<DimResult> = py
+            .detach(|| -> Result<Vec<DimResult>, String> {
+                match &self.backend {
+                    EngineBackend::Memory(store) => {
+                        let now_mono = self.clock.now_monotonic();
+                        Ok(checks
+                            .into_iter()
+                            .map(|(key, limit_count, window_nanos)| {
+                                store.check_and_increment(
+                                    &key,
+                                    limit_count,
+                                    window_nanos,
+                                    self.config.algorithm,
+                                    now_mono,
+                                    now_unix,
+                                )
+                            })
+                            .collect())
+                    }
+                    EngineBackend::Redis(redis) => redis
+                        .evaluate_many(&checks, now_unix)
+                        .map_err(|e| e.to_string()),
+                }
+            })
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        let eval = EvalResult::from_dims(&dim_results);
+        let headers = build_headers_dict(py, &eval, include_retry_after)?;
+        let meta = build_meta_dict(py, &eval, now_unix)?;
+        Ok((eval.allowed, headers, meta))
+    }
+
+    /// Async variant of `check()` for Redis-backed deployments.
+    ///
+    /// Returns an awaitable that resolves to `(allowed, headers_dict, meta_dict)`.
+    pub fn check_async<'py>(
+        &self,
+        py: Python<'py>,
+        user: &str,
+        tenant: Option<&str>,
+        tool: &str,
+        now_unix: i64,
+        include_retry_after: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let checks = self.build_checks(user, tenant, tool);
+        if checks.is_empty() {
+            return future_into_py(py, async move {
+                Python::attach(|py| -> PyResult<Py<PyAny>> {
+                    let headers = PyDict::new(py);
+                    let meta = PyDict::new(py);
+                    meta.set_item("limited", false)?;
+                    let tup = pyo3::types::PyTuple::new(
+                        py, [true.into_pyobject(py)?.to_owned().into_any(), headers.into_any(), meta.into_any()],
+                    )?;
+                    Ok(tup.into())
+                })
+            });
+        }
+
+        let backend = match &self.backend {
+            EngineBackend::Memory(store) => AsyncBackend::Memory(Arc::clone(store)),
+            EngineBackend::Redis(redis) => AsyncBackend::Redis(Arc::clone(redis)),
+        };
+        let algorithm = self.config.algorithm;
+        let clock = Arc::clone(&self.clock);
+
+        future_into_py(py, async move {
+            let dim_results: Vec<DimResult> = match backend {
+                AsyncBackend::Memory(store) => {
+                    let now_mono = clock.now_monotonic();
+                    checks
+                        .into_iter()
+                        .map(|(key, limit_count, window_nanos)| {
+                            store.check_and_increment(
+                                &key, limit_count, window_nanos, algorithm, now_mono, now_unix,
+                            )
+                        })
+                        .collect()
+                }
+                AsyncBackend::Redis(redis) => redis
+                    .evaluate_many_async(&checks, now_unix)
+                    .await
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
+            };
+
+            let eval = EvalResult::from_dims(&dim_results);
+            Python::attach(|py| -> PyResult<Py<PyAny>> {
+                let headers = build_headers_dict(py, &eval, include_retry_after)?;
+                let meta = build_meta_dict(py, &eval, now_unix)?;
+                let tup = pyo3::types::PyTuple::new(
+                    py, [eval.allowed.into_pyobject(py)?.to_owned().into_any(), headers.into_any(), meta.into_any()],
+                )?;
+                Ok(tup.into())
+            })
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers — dimension key building and dict construction
+// ---------------------------------------------------------------------------
+
+impl RateLimiterEngine {
+    /// Build dimension checks from engine config.
+    /// Mirrors Python `_build_rust_checks()` but runs in Rust.
+    fn build_checks(&self, user: &str, tenant: Option<&str>, tool: &str) -> Vec<(String, u64, u64)> {
+        let mut checks = Vec::with_capacity(3);
+        if let Some(ref rl) = self.config.by_user {
+            checks.push((format!("user:{}", user), rl.count, rl.window_nanos));
+        }
+        if let (Some(t), Some(rl)) = (tenant, &self.config.by_tenant) {
+            checks.push((format!("tenant:{}", t), rl.count, rl.window_nanos));
+        }
+        // Tool names are already normalised (lowercase) in EngineConfig at init time.
+        // The caller passes the already-lowercased tool name from Python.
+        if let Some(rl) = self.config.by_tool.get(tool) {
+            checks.push((format!("tool:{}", tool), rl.count, rl.window_nanos));
+        }
+        checks
+    }
+}
+
+/// Build HTTP rate-limit headers dict — mirrors Python `_make_headers()`.
+fn build_headers_dict<'py>(
+    py: Python<'py>,
+    eval: &EvalResult,
+    include_retry_after: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let headers = PyDict::new(py);
+    if eval.limit == u64::MAX {
+        return Ok(headers);
+    }
+    headers.set_item("X-RateLimit-Limit", eval.limit.to_string())?;
+    headers.set_item("X-RateLimit-Remaining", eval.remaining.to_string())?;
+    headers.set_item("X-RateLimit-Reset", eval.reset_timestamp.to_string())?;
+    if include_retry_after {
+        let retry = eval.retry_after.unwrap_or(0);
+        headers.set_item("Retry-After", retry.to_string())?;
+    }
+    Ok(headers)
+}
+
+/// Build metadata dict — mirrors Python `_rust_to_plugin_meta()`.
+fn build_meta_dict<'py>(
+    py: Python<'py>,
+    eval: &EvalResult,
+    now_unix: i64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let meta = PyDict::new(py);
+    let reset_in = eval
+        .retry_after
+        .unwrap_or_else(|| (eval.reset_timestamp - now_unix).max(0));
+    meta.set_item("limited", true)?;
+    meta.set_item("remaining", eval.remaining)?;
+    meta.set_item("reset_in", reset_in)?;
+
+    let has_violated = !eval.violated_dimensions.is_empty();
+    let has_allowed = !eval.allowed_dimensions.is_empty();
+
+    if has_violated || has_allowed {
+        let dims = PyDict::new(py);
+        if has_violated {
+            let violated_list = PyList::empty(py);
+            for dim in &eval.violated_dimensions {
+                let d = PyDict::new(py);
+                let dim_reset_in = dim
+                    .retry_after
+                    .unwrap_or_else(|| (dim.reset_timestamp - now_unix).max(0));
+                d.set_item("limited", true)?;
+                d.set_item("remaining", dim.remaining)?;
+                d.set_item("reset_in", dim_reset_in)?;
+                violated_list.append(d)?;
+            }
+            dims.set_item("violated", violated_list)?;
+        }
+        if has_allowed {
+            let allowed_list = PyList::empty(py);
+            for dim in &eval.allowed_dimensions {
+                let d = PyDict::new(py);
+                let dim_reset_in = (dim.reset_timestamp - now_unix).max(0);
+                d.set_item("limited", true)?;
+                d.set_item("remaining", dim.remaining)?;
+                d.set_item("reset_in", dim_reset_in)?;
+                allowed_list.append(d)?;
+            }
+            dims.set_item("allowed", allowed_list)?;
+        }
+        meta.set_item("dimensions", dims)?;
+    }
+
+    Ok(meta)
 }
 
 #[cfg(test)]

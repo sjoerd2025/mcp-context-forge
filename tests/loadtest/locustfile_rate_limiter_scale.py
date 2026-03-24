@@ -936,6 +936,17 @@ class ScaleComparisonUser(FastHttpUser):
                     return
                 if "error" in data:
                     err = data["error"]
+                    err_msg = str(err.get("message", "")).lower()
+                    err_data_str = str(err.get("data", "")).lower()
+                    # Rate-limit violations may arrive as JSON-RPC errors when the
+                    # PluginViolationError is caught by FastAPI's global handler.
+                    if "rate" in err_msg or "rate_limit" in err_data_str or err.get("code") == 429:
+                        response.request_meta["name"] = "MCP tools/call [rate-limited]"
+                        response.success()
+                        bucket = int((time.time() - _test_start_time) / 30)
+                        with _stats_lock:
+                            _bucket_stats[bucket]["blocked"] += 1
+                        return
                     response.request_meta["name"] = "MCP tools/call [infra-error]"
                     response.failure(f"JSON-RPC error {err.get('code', '?')}: {err.get('message', '?')}")
                     return
