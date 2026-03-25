@@ -3481,6 +3481,7 @@ class TestToolService:
         mock_post_result.continue_processing = True
         mock_post_result.violation = None
         mock_post_result.modified_payload = None
+        mock_post_result.retry_delay_ms = 0
 
         tool_service._plugin_manager = Mock()
 
@@ -3529,6 +3530,7 @@ class TestToolService:
         mock_post_result.continue_processing = True
         mock_post_result.violation = None
         mock_post_result.modified_payload = mock_modified_payload
+        mock_post_result.retry_delay_ms = 0
 
         # First-Party
         from mcpgateway.plugins.framework import PluginResult, ToolHookType
@@ -3580,6 +3582,7 @@ class TestToolService:
         mock_post_result.continue_processing = True
         mock_post_result.violation = None
         mock_post_result.modified_payload = mock_modified_payload
+        mock_post_result.retry_delay_ms = 0
 
         # First-Party
         from mcpgateway.plugins.framework import ToolHookType
