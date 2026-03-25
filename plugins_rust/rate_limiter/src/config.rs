@@ -78,6 +78,8 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
+    /// Parse an algorithm name from a string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "fixed_window" => Some(Self::FixedWindow),

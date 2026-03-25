@@ -64,6 +64,12 @@ pub struct MemoryStore {
     call_count: AtomicU64,
 }
 
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryStore {
     pub fn new() -> Self {
         Self {
@@ -280,7 +286,7 @@ fn sliding_window(
 ) -> DimResult {
     // Evict timestamps older than the window (amortized cleanup).
     let cutoff = now_mono.saturating_sub(window_nanos);
-    while timestamps.front().map_or(false, |&t| t <= cutoff) {
+    while timestamps.front().is_some_and(|&t| t <= cutoff) {
         timestamps.pop_front();
     }
 
