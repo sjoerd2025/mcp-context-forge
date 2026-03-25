@@ -23,6 +23,8 @@ import random
 from locust import between, task
 from locust.contrib.fasthttp import FastHttpUser
 
+from tests.loadtest.secret_detection_benchmark_utils import is_secret_detection_blocked
+
 
 class SecretsDetectionUser(FastHttpUser):
     """User that sends prompts with and without secrets to test detection performance."""
@@ -96,15 +98,13 @@ class SecretsDetectionUser(FastHttpUser):
             name="/rpc prompts/get [secret-blocked]",
             catch_response=True,
         ) as response:
-            # Expect 403 when secrets are detected and blocked
-            if response.status_code == 403:
+            if is_secret_detection_blocked(response):
                 self.secrets_blocked_count += 1
                 response.success()
             elif response.status_code == 200:
                 self.secrets_not_blocked_count += 1
-                response.failure("Secret-bearing prompt unexpectedly succeeded with HTTP 200")
+                response.failure("Secret-bearing payload was accepted without a secrets-detection violation")
+                if self.secrets_not_blocked_count % 10 == 0:
+                    print(f"⚠️  Warning: {self.secrets_not_blocked_count} secrets not blocked (may indicate detection disabled)")
             else:
                 response.failure(f"Unexpected status {response.status_code}")
-
-
-# Made with Bob

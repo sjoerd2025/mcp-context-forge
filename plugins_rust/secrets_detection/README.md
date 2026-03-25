@@ -52,9 +52,9 @@ secrets_detection:
       generic_api_key_assignment: false  # Broad heuristic; useful for X-API-Key/api_key=... style coverage, but can increase false positives
       slack_token: true
       private_key_block: true
-      jwt_like: true
-      hex_secret_32: true
-      base64_24: true
+      jwt_like: false
+      hex_secret_32: false
+      base64_24: false
     redact: false                    # Replace secrets with redaction_text
     redaction_text: "***REDACTED***"
     block_on_detection: true         # Block requests containing secrets

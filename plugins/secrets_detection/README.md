@@ -24,9 +24,9 @@ Configuration (example)
       generic_api_key_assignment: false  # Broad heuristic; enable only if you want generic header/assignment coverage
       slack_token: true
       private_key_block: true
-      jwt_like: true
-      hex_secret_32: true
-      base64_24: true
+      jwt_like: false  # Broad heuristic; keep disabled by default unless you explicitly want warning/block coverage for JWT-shaped tokens
+      hex_secret_32: false  # Broad heuristic; keep disabled by default unless you explicitly want coverage for generic hex strings
+      base64_24: false  # Broad heuristic; keep disabled by default unless you explicitly want coverage for generic base64-like strings
     redact: false                # replace matches with redaction_text
     redaction_text: "***REDACTED***"
     block_on_detection: true

@@ -12,6 +12,7 @@ from mcpgateway.common.models import ResourceContent
 from mcpgateway.plugins.framework import PluginConfig, ResourceHookType
 from mcpgateway.services.resource_service import ResourceService
 from plugins.secrets_detection.secrets_detection import SecretsDetectionPlugin
+from tests.loadtest.secret_detection_benchmark_utils import is_secret_detection_blocked
 
 # Try to import Rust implementation
 try:
@@ -568,3 +569,40 @@ def test_plugin_warns_when_broad_patterns_enabled(caplog):
 
     assert "Broad secrets heuristics enabled" in caplog.text
     assert "generic_api_key_assignment" in caplog.text
+
+
+def test_benchmark_helper_treats_json_rpc_secret_violation_as_blocked():
+    """Load-test helper should recognize JSON-RPC secret violations even on HTTP 200."""
+
+    class DummyResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "error": {
+                    "message": "Plugin Violation: secrets detected",
+                    "data": {
+                        "plugin_error_code": "SECRETS_DETECTED",
+                    },
+                }
+            }
+
+    assert is_secret_detection_blocked(DummyResponse()) is True
+
+
+def test_benchmark_helper_does_not_treat_success_payload_as_blocked():
+    """Load-test helper should not flag ordinary successful responses as blocked."""
+
+    class DummyResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "result": {
+                    "messages": [],
+                }
+            }
+
+    assert is_secret_detection_blocked(DummyResponse()) is False
