@@ -166,16 +166,16 @@ async def run_agent(request: Request) -> Response:
     # Capture and log raw body
     body = await request.body()
     print(f"Raw request body: {body.decode('utf-8')}")
-    
+
     import json
     body_dict = json.loads(body)
-    
+
     query_text = ""
-    
+
     # Handle JSONRPC format (ContextForge sends this for agents with URLs ending in /)
     if "jsonrpc" in body_dict:
         params = body_dict.get("params", {})
-        
+
         # Handle nested message structure from Admin UI test
         if "message" in params and isinstance(params["message"], dict):
             message_obj = params["message"]
@@ -202,7 +202,7 @@ async def run_agent(request: Request) -> Response:
     elif "message" in body_dict:
         query_text = body_dict["message"]
         print(f"Extracted from message field: {query_text}")
-    
+
     if not query_text:
         query_text = "Hello"
         print("No query found, using default: Hello")
