@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 
 # Third-Party
+import anyio
 import httpx
 import jq
 import jsonschema
@@ -709,6 +710,8 @@ class ToolService(BaseService):
                 "visibility": gateway.visibility,
                 "tags": gateway.tags or [],
                 "gateway_mode": getattr(gateway, "gateway_mode", "cache"),  # Gateway mode for direct proxy support
+                "client_cert": getattr(gateway, "client_cert", None),
+                "client_key": getattr(gateway, "client_key", None),
             }
 
         return {"status": "active", "tool": tool_payload, "gateway": gateway_payload}
@@ -1688,7 +1691,7 @@ class ToolService(BaseService):
             # Use provided parameters or schema values
             tool_team_id = team_id if team_id is not None else getattr(tool, "team_id", None)
             tool_owner_email = owner_email or getattr(tool, "owner_email", None) or created_by
-            tool_visibility = visibility if visibility is not None else getattr(tool, "visibility", "public")
+            tool_visibility = visibility if visibility is not None else (getattr(tool, "visibility", None) or "public")
 
             existing_tool = existing_tools_map.get(tool.name)
 
@@ -1934,7 +1937,16 @@ class ToolService(BaseService):
             converter_is_default = False
 
         if cursor is None and user_email is None and token_teams is None and page is None and converter_is_default:
-            filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None, gateway_id=gateway_id, limit=limit)
+            # Include visibility in the cache hash so admin requests that include
+            # an explicit visibility filter don't get served stale results from
+            # a previously cached unfiltered admin request.
+            filters_hash = cache.hash_filters(
+                include_inactive=include_inactive,
+                tags=sorted(tags) if tags else None,
+                gateway_id=gateway_id,
+                limit=limit,
+                visibility=visibility,
+            )
             cached = await cache.get("tools", filters_hash)
             if cached is not None:
                 # Reconstruct ToolRead objects from cached dicts
@@ -2084,6 +2096,7 @@ class ToolService(BaseService):
                 select(DbTool)
                 .options(joinedload(DbTool.gateway), joinedload(DbTool.email_team))
                 .options(selectinload(DbTool.metrics))
+                .options(selectinload(DbTool.metrics_hourly))
                 .join(server_tool_association, DbTool.id == server_tool_association.c.tool_id)
                 .where(server_tool_association.c.server_id == server_id)
             )
@@ -2477,7 +2490,6 @@ class ToolService(BaseService):
                     delete_metrics_in_batches(db, ToolMetricsHourly, ToolMetricsHourly.tool_id, tool_id)
 
             # Use DELETE with rowcount check for database-agnostic atomic delete
-            # (RETURNING is not supported on MySQL/MariaDB)
             stmt = delete(DbTool).where(DbTool.id == tool_id)
             result = db.execute(stmt)
             if result.rowcount == 0:
@@ -3904,18 +3916,54 @@ class ToolService(BaseService):
                             session_short = mcp_session_id[:8] if len(mcp_session_id) >= 8 else mcp_session_id
                             logger.debug(f"[AFFINITY] Worker {worker_id} | Session {session_short}... | Tool: {name} | Normalized MCP-Session-Id → x-mcp-session-id for pool affinity (MCP transport)")
 
-                    def create_ssl_context(ca_certificate: str) -> ssl.SSLContext:
-                        """Create an SSL context with the provided CA certificate.
+                    # mTLS client cert/key: resolve from payload, then override with runtime gateway if available
+                    client_cert_from_payload = gateway_payload.get("client_cert") if has_gateway else None
+                    client_key_from_payload = gateway_payload.get("client_key") if has_gateway else None
 
-                        Uses caching to avoid repeated SSL context creation for the same certificate.
+                    # Resolve client cert/key: payload values take precedence, runtime values override if present
+                    gateway_client_cert = client_cert_from_payload
+                    gateway_client_key = client_key_from_payload
+                    if has_gateway and gateway is not None:
+                        runtime_gateway_client_cert = getattr(gateway, "client_cert", None)
+                        runtime_gateway_client_key = getattr(gateway, "client_key", None)
+                        if runtime_gateway_client_cert:
+                            gateway_client_cert = runtime_gateway_client_cert
+                        if runtime_gateway_client_key:
+                            gateway_client_key = runtime_gateway_client_key
+
+                    # Decrypt client_key if stored encrypted
+                    if gateway_client_key:
+                        try:
+                            # First-Party
+                            from mcpgateway.services.encryption_service import get_encryption_service  # pylint: disable=import-outside-toplevel
+
+                            _enc = get_encryption_service(settings.auth_encryption_secret)
+                            gateway_client_key = _enc.decrypt_secret_or_plaintext(gateway_client_key)
+                        except Exception as _dec_exc:
+                            logger.debug("client_key decryption skipped, using as-is: %s", _dec_exc)
+
+                    def create_ssl_context(
+                        ca_certificate: str,
+                        client_cert: str | None = None,
+                        client_key: str | None = None,
+                    ) -> ssl.SSLContext:
+                        """Create an SSL context with the provided CA certificate and optional mTLS credentials.
+
+                        Uses caching to avoid repeated SSL context creation for the same certificate(s).
 
                         Args:
                             ca_certificate: CA certificate in PEM format
+                            client_cert: Optional client cert path or PEM for mTLS
+                            client_key: Optional client key path or PEM for mTLS
 
                         Returns:
                             ssl.SSLContext: Configured SSL context
                         """
-                        return get_cached_ssl_context(ca_certificate)
+                        return get_cached_ssl_context(ca_certificate, client_cert=client_cert, client_key=client_key)
+
+                    # Capture mTLS client cert/key values for passing to nested function
+                    _client_cert_value = gateway_client_cert
+                    _client_key_value = gateway_client_key
 
                     def get_httpx_client_factory(
                         headers: dict[str, str] | None = None,
@@ -3935,6 +3983,9 @@ class ToolService(BaseService):
                         Raises:
                             Exception: If CA certificate signature is invalid
                         """
+                        # Use captured client cert/key values from closure
+                        client_cert_value = _client_cert_value
+                        client_key_value = _client_key_value
                         # Use local variables instead of ORM objects (captured from outer scope)
                         valid = False
                         if gateway_ca_cert:
@@ -3946,8 +3997,15 @@ class ToolService(BaseService):
                         # First-Party
                         from mcpgateway.services.http_client_service import get_default_verify, get_http_timeout  # pylint: disable=import-outside-toplevel
 
-                        if valid:
-                            ctx = create_ssl_context(gateway_ca_cert)
+                        # For plain HTTP gateway URLs, skip SSL context entirely to avoid unnecessary SSL setup.
+                        if gateway_url and gateway_url.lower().startswith("http://"):
+                            ctx = None
+                        elif valid and gateway_ca_cert:
+                            ctx = create_ssl_context(
+                                gateway_ca_cert,
+                                client_cert=client_cert_value,
+                                client_key=client_key_value,
+                            )
                         else:
                             ctx = None
 
@@ -4007,6 +4065,7 @@ class ToolService(BaseService):
 
                         try:
                             # Use session pool if enabled for 10-20x latency improvement
+                            tool_call_result = None
                             use_pool = False
                             pool = None
                             if settings.mcp_session_pool_enabled:
@@ -4027,7 +4086,8 @@ class ToolService(BaseService):
                                     user_identity=app_user_email,
                                     gateway_id=gateway_id_str,
                                 ) as pooled:
-                                    tool_call_result = await asyncio.wait_for(pooled.session.call_tool(tool_name_original, arguments, meta=meta_data), timeout=effective_timeout)
+                                    with anyio.fail_after(effective_timeout):
+                                        tool_call_result = await pooled.session.call_tool(tool_name_original, arguments, meta=meta_data)
                             else:
                                 # Non-pooled path: safe to add per-request headers
                                 if correlation_id and headers:
@@ -4036,7 +4096,8 @@ class ToolService(BaseService):
                                 async with sse_client(url=server_url, headers=headers, httpx_client_factory=get_httpx_client_factory) as streams:
                                     async with ClientSession(*streams) as session:
                                         await session.initialize()
-                                        tool_call_result = await asyncio.wait_for(session.call_tool(tool_name_original, arguments, meta=meta_data), timeout=effective_timeout)
+                                        with anyio.fail_after(effective_timeout):
+                                            tool_call_result = await session.call_tool(tool_name_original, arguments, meta=meta_data)
 
                             # Log successful MCP call
                             mcp_duration_ms = (time.time() - mcp_start_time) * 1000
@@ -4152,6 +4213,7 @@ class ToolService(BaseService):
 
                         try:
                             # Use session pool if enabled for 10-20x latency improvement
+                            tool_call_result = None
                             use_pool = False
                             pool = None
                             if settings.mcp_session_pool_enabled:
@@ -4174,7 +4236,8 @@ class ToolService(BaseService):
                                     user_identity=app_user_email,
                                     gateway_id=gateway_id_str,
                                 ) as pooled:
-                                    tool_call_result = await asyncio.wait_for(pooled.session.call_tool(tool_name_original, arguments, meta=meta_data), timeout=effective_timeout)
+                                    with anyio.fail_after(effective_timeout):
+                                        tool_call_result = await pooled.session.call_tool(tool_name_original, arguments, meta=meta_data)
                             else:
                                 # Non-pooled path: safe to add per-request headers
                                 if correlation_id and headers:
@@ -4184,7 +4247,8 @@ class ToolService(BaseService):
                                 async with streamablehttp_client(url=server_url, headers=headers, httpx_client_factory=get_httpx_client_factory) as (read_stream, write_stream, _get_session_id):
                                     async with ClientSession(read_stream, write_stream) as session:
                                         await session.initialize()
-                                        tool_call_result = await asyncio.wait_for(session.call_tool(tool_name_original, arguments, meta=meta_data), timeout=effective_timeout)
+                                        with anyio.fail_after(effective_timeout):
+                                            tool_call_result = await session.call_tool(tool_name_original, arguments, meta=meta_data)
 
                             # Log successful MCP call
                             mcp_duration_ms = (time.time() - mcp_start_time) * 1000

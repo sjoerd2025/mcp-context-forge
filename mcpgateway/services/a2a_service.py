@@ -26,7 +26,9 @@ from sqlalchemy.orm import Session
 # First-Party
 from mcpgateway.cache.a2a_stats_cache import a2a_stats_cache
 from mcpgateway.db import A2AAgent as DbA2AAgent
-from mcpgateway.db import A2AAgentMetric, A2AAgentMetricsHourly, EmailTeam, fresh_db_session, get_for_update
+from mcpgateway.db import A2AAgentMetric, A2AAgentMetricsHourly, EmailTeam
+from mcpgateway.db import EmailTeamMember as DbEmailTeamMember
+from mcpgateway.db import fresh_db_session, get_for_update
 from mcpgateway.schemas import A2AAgentAggregateMetrics, A2AAgentCreate, A2AAgentMetrics, A2AAgentRead, A2AAgentUpdate
 from mcpgateway.services.base_service import BaseService
 from mcpgateway.services.encryption_service import protect_oauth_config_for_storage
@@ -147,6 +149,36 @@ class A2AAgentNameConflictError(A2AAgentError):
         super().__init__(message)
 
 
+def _validate_a2a_team_assignment(db: Session, user_email: Optional[str], target_team_id: Optional[str]) -> None:
+    """Validate team assignment for A2A agent updates.
+
+    Args:
+        db: Database session used for membership checks.
+        user_email: Requesting user email. When omitted, ownership checks are skipped.
+        target_team_id: Team identifier to validate.
+
+    Raises:
+        ValueError: If team does not exist or caller lacks ownership.
+    """
+    if not target_team_id:
+        raise ValueError("Cannot set visibility to 'team' without a team_id")
+
+    team = db.query(EmailTeam).filter(EmailTeam.id == target_team_id).first()
+    if not team:
+        raise ValueError(f"Team {target_team_id} not found")
+
+    if not user_email:
+        return
+
+    membership = (
+        db.query(DbEmailTeamMember)
+        .filter(DbEmailTeamMember.team_id == target_team_id, DbEmailTeamMember.user_email == user_email, DbEmailTeamMember.is_active, DbEmailTeamMember.role == "owner")
+        .first()
+    )
+    if not membership:
+        raise ValueError("User membership in team not sufficient for this update.")
+
+
 class A2AAgentService(BaseService):
     """Service for managing A2A agents in the gateway.
 
@@ -257,9 +289,11 @@ class A2AAgentService(BaseService):
             return True
 
         # Team agents: check team membership
-        # At this point token_teams is guaranteed to be a non-empty list
-        # (None handled by admin bypass, [] by public-only check)
+        # token_teams=None means admin bypass — allow all team agents
+        # ([] already handled by public-only check above)
         if agent.visibility == "team":
+            if token_teams is None:
+                return True
             return agent.team_id in token_teams
 
         return False
@@ -583,7 +617,7 @@ class A2AAgentService(BaseService):
         # ══════════════════════════════════════════════════════════════════════
         cache = _get_registry_cache()
         if cursor is None and user_email is None and token_teams is None and page is None:
-            filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None)
+            filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None, visibility=visibility)
             cached = await cache.get("agents", filters_hash)
             if cached is not None:
                 # Reconstruct A2AAgentRead objects from cached dicts
@@ -990,8 +1024,50 @@ class A2AAgentService(BaseService):
                 if field in ("auth_query_param_key", "auth_query_param_value"):
                     continue
 
+                # auth_headers is on the schema but not the DB model; translate
+                # it into auth_value, preserving masked placeholders from the
+                # existing encrypted value so an unchanged edit does not
+                # overwrite real credentials with the mask string.
+                if field == "auth_headers" and value and isinstance(value, list):
+                    # First-Party
+                    from mcpgateway.config import settings as _settings  # pylint: disable=import-outside-toplevel
+
+                    existing_auth_raw = getattr(agent, "auth_value", None)
+                    existing_auth: Dict[str, str] = {}
+                    if isinstance(existing_auth_raw, str):
+                        try:
+                            existing_auth = decode_auth(existing_auth_raw)
+                        except Exception:
+                            existing_auth = {}
+                    elif isinstance(existing_auth_raw, dict):
+                        existing_auth = existing_auth_raw
+
+                    header_dict: Dict[str, str] = {}
+                    for header in value:
+                        key = header.get("key")
+                        if not key:
+                            continue
+                        hval = header.get("value", "")
+                        if hval == _settings.masked_auth_value and key in existing_auth:
+                            header_dict[key] = existing_auth[key]
+                        else:
+                            header_dict[key] = hval
+
+                    if header_dict:
+                        agent.auth_value = encode_auth(header_dict)
+                    continue
+
                 if field == "oauth_config":
                     value = await protect_oauth_config_for_storage(value, existing_oauth_config=agent.oauth_config)
+
+                # Validate team reassignment before persisting
+                if field == "team_id" and value is not None and value != agent.team_id:
+                    _validate_a2a_team_assignment(db, user_email, value)
+
+                # Validate visibility transition to "team"
+                if field == "visibility" and value == "team":
+                    target_team_id = update_data.get("team_id", agent.team_id) if "team_id" in update_data else agent.team_id
+                    _validate_a2a_team_assignment(db, user_email, target_team_id)
 
                 if hasattr(agent, field):
                     setattr(agent, field, value)
@@ -1535,7 +1611,7 @@ class A2AAgentService(BaseService):
 
         if is_cache_enabled():
             cached = metrics_cache.get("a2a")
-            if cached is not None:
+            if cached is not None and isinstance(cached, dict):
                 return A2AAgentAggregateMetrics(**cached)
 
         # Get total/active agent counts from cache (avoids 2 COUNT queries per call)

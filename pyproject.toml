@@ -1,10 +1,10 @@
 # ----------------------------------------------------------------
 # 💡 Build system (PEP 517)
-#     - setuptools ≥ 77 gives SPDX licence support (PEP 639)
+#     - setuptools ≥ 78.1.1 gives SPDX licence support (PEP 639) and fixes CVE-2025-47273
 #     - wheel is needed by most build front-ends
 # ----------------------------------------------------------------
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=78.1.1", "wheel>=0.46.2"]
 build-backend = "setuptools.build_meta"
 
 # ----------------------------------------------------------------
@@ -192,14 +192,6 @@ redis-pure = [
 # Install with: sudo apt-get install libpq-dev (or dnf install postgresql-devel)
 postgres = [
     "psycopg[c,binary]>=3.3.3",
-]
-
-mysql = [
-    "pymysql>=1.1.2",
-]
-
-mariadb = [
-    "mariadb>=1.1.14",
 ]
 
 llmchat = [
@@ -458,7 +450,7 @@ preview = true
 max-args = 12               # .pylintrc max-args
 max-positional-args = 16    # .pylintrc max-positional-arguments
 max-returns = 16            # .pylintrc max-returns
-max-bool-expr = 6           # .pylintrc max-bool-expr
+max-bool-expr = 7           # .pylintrc max-bool-expr
 max-branches = 12           # .pylintrc max-branches (ignored; PLR0912 disabled)
 max-statements = 50         # .pylintrc max-statements (ignored; PLR0915 disabled)
 max-locals = 15             # .pylintrc max-locals (ignored; PLR0914 disabled)

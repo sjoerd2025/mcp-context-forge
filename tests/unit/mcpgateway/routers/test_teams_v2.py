@@ -194,7 +194,7 @@ class TestTeamsRouterV2:
     async def test_update_team_success(self, mock_user_context, mock_db, mock_team):
         """Test updating a team successfully."""
         team_id = mock_team.id
-        request = TeamUpdateRequest(name="Updated Team", description="Updated description", visibility="public", max_members=200)
+        request = TeamUpdateRequest(name="Updated Team", description="Updated description", visibility="public", max_members=100)
 
         with patch("mcpgateway.routers.teams.TeamManagementService") as MockService:
             mock_service = AsyncMock(spec=TeamManagementService)
@@ -206,7 +206,7 @@ class TestTeamsRouterV2:
             result = await teams.update_team(team_id, request, current_user=mock_user_context, db=mock_db)
 
             assert result.id == mock_team.id
-            mock_service.update_team.assert_called_once_with(team_id=team_id, name=request.name, description=request.description, visibility=request.visibility, max_members=request.max_members)
+            mock_service.update_team.assert_called_once_with(team_id=team_id, name=request.name, description=request.description, visibility=request.visibility, max_members=request.max_members, skip_limits=False)
 
     @pytest.mark.asyncio
     async def test_delete_team_success(self, mock_user_context, mock_db):

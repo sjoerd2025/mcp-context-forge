@@ -93,7 +93,7 @@ For a list of upcoming features, check out the [ContextForge Roadmap](https://ib
 <summary><strong>🔌 Gateway Layer with Protocol Flexibility</strong></summary>
 
 * Federates any MCP server or REST API
-* Lets you choose your MCP protocol version (e.g., `2025-06-18`)
+* Lets you choose your MCP protocol version (e.g., `2025-11-25`)
 * Exposes a single, unified interface for diverse backends
 
 </details>
@@ -135,7 +135,7 @@ For a list of upcoming features, check out the [ContextForge Roadmap](https://ib
 * Real-time log viewer with filtering, search, and export capabilities
 * Auth: Basic, JWT, or custom schemes
 * Structured logs, health endpoints, metrics
-* 400+ tests, Makefile targets, live reload, pre-commit hooks
+* 7,000+ tests, Makefile targets, live reload, pre-commit hooks
 
 </details>
 
@@ -183,7 +183,7 @@ uvx --from mcp-contextforge-gateway mcpgateway --host 0.0.0.0 --port 4444
 <details>
 <summary><strong>📋 Prerequisites</strong></summary>
 
-* **Python ≥ 3.10** (3.11 recommended)
+* **Python ≥ 3.11**
 * **curl + jq** - only for the last smoke-test step
 
 </details>
@@ -400,19 +400,15 @@ Please note: Currently, arm64 is not supported on production. If you are e.g. ru
 
 ### 🚀 Quick Start - Docker Compose
 
-Get a full stack running with MariaDB and Redis in under 30 seconds:
+Get a full stack running with PostgreSQL and Redis in under 30 seconds:
 
 ```bash
 # Clone and start the stack
 git clone https://github.com/IBM/mcp-context-forge.git
 cd mcp-context-forge
 
-# Start with MariaDB (recommended for production)
+# Start with PostgreSQL (recommended for production)
 docker compose up -d
-
-# Or start with PostgreSQL
-# Uncomment postgres in docker-compose.yml and comment mariadb section
-# docker compose up -d
 
 # Check status
 docker compose ps
@@ -420,18 +416,18 @@ docker compose ps
 # View logs
 docker compose logs -f gateway
 
-# Access Admin UI: http://localhost:4444/admin (login with PLATFORM_ADMIN_EMAIL/PASSWORD)
+# Access Admin UI: http://localhost:8080/admin (login with PLATFORM_ADMIN_EMAIL/PASSWORD)
 # Generate API token
 docker compose exec gateway python3 -m mcpgateway.utils.create_jwt_token \
   --username admin@example.com --exp 10080 --secret my-test-key
 ```
 
 **What you get:**
-- 🗄️ **MariaDB 10.6** - Production-ready database with 36+ tables
+- 🗄️ **PostgreSQL** - Production-ready database with 55+ tables
 - 🚀 **ContextForge** - Full-featured gateway with Admin UI
 - 📊 **Redis** - High-performance caching and session storage
 - 🔧 **Admin Tools** - pgAdmin, Redis Insight for database management
-- 🌐 **Nginx Proxy** - Caching reverse proxy (optional)
+- 🌐 **Nginx Proxy** - Caching reverse proxy on port 8080
 
 **Enable HTTPS (optional):**
 ```bash
@@ -466,15 +462,7 @@ Deploy to Kubernetes with enterprise-grade features:
 git clone https://github.com/IBM/mcp-context-forge.git
 cd mcp-context-forge/charts/mcp-stack
 
-# Install with MariaDB
-helm install mcp-gateway . \
-  --set mcpContextForge.secret.PLATFORM_ADMIN_EMAIL=admin@yourcompany.com \
-  --set mcpContextForge.secret.PLATFORM_ADMIN_PASSWORD=changeme \
-  --set mcpContextForge.secret.JWT_SECRET_KEY=your-secret-key \
-  --set postgres.enabled=false \
-  --set mariadb.enabled=true
-
-# Or install with PostgreSQL (default)
+# Install with PostgreSQL (default)
 helm install mcp-gateway . \
   --set mcpContextForge.secret.PLATFORM_ADMIN_EMAIL=admin@yourcompany.com \
   --set mcpContextForge.secret.PLATFORM_ADMIN_PASSWORD=changeme \
@@ -501,7 +489,7 @@ kubectl exec deployment/mcp-gateway-mcp-context-forge -- \
 
 **Enterprise Features:**
 - 🔄 **Auto-scaling** - HPA with CPU/memory targets
-- 🗄️ **Database Choice** - PostgreSQL, MariaDB, or MySQL
+- 🗄️ **Database Choice** - PostgreSQL (prod), SQLite (dev)
 - 📊 **Observability** - Prometheus metrics, OpenTelemetry tracing
 - 🔒 **Security** - RBAC, network policies, secret management
 - 🚀 **High Availability** - Multi-replica deployments with Redis clustering
@@ -760,6 +748,17 @@ These settings are enabled by default for security—only disable for backward c
 | `REQUIRE_TOKEN_EXPIRATION` | Require exp claim in tokens | `true` |
 | `PUBLIC_REGISTRATION_ENABLED` | Allow public user self-registration | `false` |
 
+### 🛡️ Content Security
+
+Content size limits prevent DoS attacks and ensure system stability:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CONTENT_MAX_RESOURCE_SIZE` | Maximum resource content size (bytes) | `102400` (100KB) |
+| `CONTENT_MAX_PROMPT_SIZE` | Maximum prompt template size (bytes) | `10240` (10KB) |
+
+**Note:** Size limits apply only to new create/update operations. Existing content is not retroactively validated.
+
 ### ⚙️ Project Defaults (Dev Setup)
 
 These values differ from code defaults to provide a working local/dev setup:
@@ -770,7 +769,7 @@ These values differ from code defaults to provide a working local/dev setup:
 | `MCPGATEWAY_UI_ENABLED` | Enable Admin UI dashboard | `true` |
 | `MCPGATEWAY_ADMIN_API_ENABLED` | Enable Admin API endpoints | `true` |
 | `DATABASE_URL` | SQLAlchemy connection URL | `sqlite:///./mcp.db` |
-| `SECURE_COOKIES` | Set `false` for HTTP (non-HTTPS) dev | `true` |
+| `SECURE_COOKIES` | Set `false` for HTTP (non-HTTPS) dev | `false` |
 
 ### 📚 Full Configuration Reference
 
@@ -900,7 +899,7 @@ mcpgateway/          # Core FastAPI application
 ├── middleware/      # Cross-cutting concerns
 └── transports/      # SSE, WebSocket, stdio, streamable HTTP
 
-tests/               # Test suite (400+ tests)
+tests/               # Test suite (7,000+ tests)
 docs/docs/           # Full documentation (MkDocs)
 charts/              # Kubernetes/Helm charts
 plugins/             # Plugin framework and implementations
@@ -933,7 +932,7 @@ make lint            # Run all linters
 make coverage        # Generate coverage report
 ```
 
-Run `make` to see all 75+ available targets.
+Run `make` to see all available targets.
 
 For development workflows, see:
 - **[Developer Workstation Setup](https://ibm.github.io/mcp-context-forge/development/developer-workstation/)**

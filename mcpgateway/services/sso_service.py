@@ -866,14 +866,25 @@ class SSOService:
     def _is_email_verified_claim(user_info: Dict[str, Any]) -> bool:
         """Evaluate email verification claim when provided by the IdP.
 
+        When the ``email_verified`` claim is **absent** from ``user_info`` (e.g.
+        Microsoft Entra ID and GitHub do not include it for work / school
+        accounts) the function returns ``True`` so that those providers are not
+        incorrectly blocked.  The check is only enforced when the IdP
+        *explicitly* supplies the claim — a ``False``/``0``/``"false"`` value
+        means the provider has flagged the address as unverified and the user
+        should be rejected.
+
         Args:
             user_info: Normalized user-info payload from provider.
 
         Returns:
-            ``True`` only when email verification claim is explicitly verified.
+            ``True`` when the claim is absent (provider does not restrict) or
+            when it is explicitly set to a truthy value; ``False`` only when the
+            provider explicitly indicates the address is *not* verified.
         """
         if "email_verified" not in user_info:
-            return False
+            # Claim not provided by IdP — treat as no restriction (pass through).
+            return True
 
         claim_value = user_info.get("email_verified")
         if isinstance(claim_value, bool):
@@ -1241,6 +1252,17 @@ class SSOService:
                     if claim in keycloak_id_token_claims and claim not in user_data:
                         user_data[claim] = keycloak_id_token_claims[claim]
 
+            # For generic OIDC providers (including Okta, IBM Verify, and any custom
+            # provider), merge groups and roles claims from the verified id_token when
+            # the userinfo response does not already contain them.  Many OIDC providers
+            # (e.g. Okta, JumpCloud) only include group claims in the id_token.
+            if provider.id not in ("github", "google", "keycloak", "entra") and verified_id_token_claims:
+                metadata = provider.provider_metadata or {}
+                groups_claim = metadata.get("groups_claim", "groups")
+                for claim in {groups_claim, "roles"}:
+                    if claim in verified_id_token_claims and claim not in user_data:
+                        user_data[claim] = verified_id_token_claims[claim]
+
             # Normalize user info across providers
             return self._normalize_user_info(provider, user_data)
 
@@ -1297,39 +1319,84 @@ class SSOService:
 
         # Handle Google provider
         if provider.id == "google":
-            return {
+            google_normalized: Dict[str, Any] = {
                 "email": user_data.get("email"),
-                "email_verified": user_data.get("email_verified"),
                 "full_name": user_data.get("name"),
                 "avatar_url": user_data.get("picture"),
                 "provider_id": user_data.get("sub"),
                 "username": user_data.get("email", "").split("@")[0],
                 "provider": "google",
             }
+            if "email_verified" in user_data:
+                google_normalized["email_verified"] = user_data["email_verified"]
+            return google_normalized
 
         # Handle IBM Verify provider
         if provider.id == "ibm_verify":
-            return {
+            metadata = provider.provider_metadata or {}
+            groups_claim = metadata.get("groups_claim", "groups")
+            groups: list[str] = []
+
+            if groups_claim in user_data:
+                groups_value = user_data.get(groups_claim, [])
+                if isinstance(groups_value, list):
+                    groups.extend(g for g in groups_value if isinstance(g, str))
+                elif isinstance(groups_value, str):
+                    groups.append(groups_value)
+
+            if "roles" in user_data:
+                roles_value = user_data.get("roles", [])
+                if isinstance(roles_value, list):
+                    groups.extend(r for r in roles_value if isinstance(r, str))
+                elif isinstance(roles_value, str):
+                    groups.append(roles_value)
+
+            ibm_normalized: Dict[str, Any] = {
                 "email": user_data.get("email"),
-                "email_verified": user_data.get("email_verified"),
                 "full_name": user_data.get("name"),
                 "avatar_url": user_data.get("picture"),
                 "provider_id": user_data.get("sub"),
                 "username": user_data.get("preferred_username") or user_data.get("email", "").split("@")[0],
                 "provider": "ibm_verify",
+                "groups": list(set(groups)),
             }
+            if "email_verified" in user_data:
+                ibm_normalized["email_verified"] = user_data["email_verified"]
+            return ibm_normalized
 
         # Handle Okta provider
         if provider.id == "okta":
-            return {
+            metadata = provider.provider_metadata or {}
+            groups_claim = metadata.get("groups_claim", "groups")
+            groups: list[str] = []
+
+            if groups_claim in user_data:
+                groups_value = user_data.get(groups_claim, [])
+                if isinstance(groups_value, list):
+                    groups.extend(g for g in groups_value if isinstance(g, str))
+                elif isinstance(groups_value, str):
+                    groups.append(groups_value)
+
+            # Merge roles claim into groups (same pattern as Entra ID)
+            if "roles" in user_data:
+                roles_value = user_data.get("roles", [])
+                if isinstance(roles_value, list):
+                    groups.extend(r for r in roles_value if isinstance(r, str))
+                elif isinstance(roles_value, str):
+                    groups.append(roles_value)
+
+            okta_normalized: Dict[str, Any] = {
                 "email": user_data.get("email"),
-                "email_verified": user_data.get("email_verified"),
                 "full_name": user_data.get("name"),
                 "avatar_url": user_data.get("picture"),
                 "provider_id": user_data.get("sub"),
                 "username": user_data.get("preferred_username") or user_data.get("email", "").split("@")[0],
                 "provider": "okta",
+                "groups": list(set(groups)),
             }
+            if "email_verified" in user_data:
+                okta_normalized["email_verified"] = user_data["email_verified"]
+            return okta_normalized
 
         # Handle Keycloak provider with role mapping
         if provider.id == "keycloak":
@@ -1360,9 +1427,8 @@ class SSOService:
                 if isinstance(custom_groups, list):
                     groups.extend(custom_groups)
 
-            return {
+            keycloak_normalized: Dict[str, Any] = {
                 "email": user_data.get(email_claim),
-                "email_verified": user_data.get("email_verified"),
                 "full_name": user_data.get("name"),
                 "avatar_url": user_data.get("picture"),
                 "provider_id": user_data.get("sub"),
@@ -1370,6 +1436,9 @@ class SSOService:
                 "provider": "keycloak",
                 "groups": list(set(groups)),  # Deduplicate
             }
+            if "email_verified" in user_data:
+                keycloak_normalized["email_verified"] = user_data["email_verified"]
+            return keycloak_normalized
 
         # Handle Microsoft Entra ID provider with role mapping
         if provider.id == "entra":
@@ -1402,9 +1471,13 @@ class SSOService:
                 if isinstance(roles_value, list):
                     groups.extend(roles_value)
 
-            return {
+            # Microsoft Entra ID work/school accounts do not include an
+            # ``email_verified`` claim in their userinfo/ID-token response.
+            # Only propagate the claim when it is explicitly present so that
+            # ``_is_email_verified_claim`` can apply its absent-means-pass-through
+            # logic and not block legitimate Entra logins.
+            entra_normalized: Dict[str, Any] = {
                 "email": email,
-                "email_verified": user_data.get("email_verified"),
                 "full_name": user_data.get("name") or email,  # Fallback to email if name missing
                 "avatar_url": user_data.get("picture"),
                 "provider_id": user_data.get("sub") or user_data.get("oid"),
@@ -1412,17 +1485,45 @@ class SSOService:
                 "provider": "entra",
                 "groups": list(set(groups)),  # Deduplicate
             }
+            if "email_verified" in user_data:
+                entra_normalized["email_verified"] = user_data["email_verified"]
+            return entra_normalized
 
-        # Generic OIDC format for all other providers
-        return {
+        # Generic OIDC format for all other providers.
+        # Only propagate email_verified when the IdP explicitly includes it so that
+        # _is_email_verified_claim's absent-means-pass-through logic applies correctly.
+        # Injecting None (via .get()) when the key is missing would cause the key to
+        # be present in the dict with a falsy value, silently blocking login.
+        metadata = provider.provider_metadata or {}
+        groups_claim = metadata.get("groups_claim", "groups")
+        groups: list[str] = []
+        if groups_claim in user_data:
+            gc = user_data.get(groups_claim, [])
+            if isinstance(gc, list):
+                groups = [g for g in gc if isinstance(g, str)]
+            elif isinstance(gc, str):
+                groups = [gc]
+
+        # Merge roles claim into groups (same pattern as Entra ID)
+        if "roles" in user_data:
+            roles_value = user_data.get("roles", [])
+            if isinstance(roles_value, list):
+                groups.extend(r for r in roles_value if isinstance(r, str))
+            elif isinstance(roles_value, str):
+                groups.append(roles_value)
+
+        generic_normalized: Dict[str, Any] = {
             "email": user_data.get("email"),
-            "email_verified": user_data.get("email_verified"),
             "full_name": user_data.get("name"),
             "avatar_url": user_data.get("picture"),
             "provider_id": user_data.get("sub"),
             "username": user_data.get("preferred_username") or user_data.get("email", "").split("@")[0],
             "provider": provider.id,
+            "groups": list(set(groups)),
         }
+        if "email_verified" in user_data:
+            generic_normalized["email_verified"] = user_data["email_verified"]
+        return generic_normalized
 
     async def authenticate_or_create_user(self, user_info: Dict[str, Any]) -> Optional[str]:
         """Authenticate existing user or create new user from SSO info.
