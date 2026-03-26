@@ -20851,7 +20851,7 @@ async function refreshGatewayTools(gatewayId, gatewayName, buttonEl) {
                 .find((row) => row.startsWith("mcpgateway_csrf_token="))
                 ?.split("=")[1] ?? "";
         const response = await fetch(
-            `${window.ROOT_PATH}/gateways/${gatewayId}/tools/refresh`,
+            `${window.ROOT_PATH}/admin/gateways/${gatewayId}/tools/refresh`,
             {
                 method: "POST",
                 credentials: "include",
@@ -20939,7 +20939,7 @@ async function refreshToolsForSelectedGateways(buttonEl) {
                         .find((row) => row.startsWith("mcpgateway_csrf_token="))
                         ?.split("=")[1] ?? "";
                 const res = await fetch(
-                    `${window.ROOT_PATH}/gateways/${gid}/tools/refresh`,
+                    `${window.ROOT_PATH}/admin/gateways/${gid}/tools/refresh`,
                     {
                         method: "POST",
                         credentials: "include",

@@ -107,6 +107,7 @@ from mcpgateway.admin import (  # admin_get_metrics,
     admin_get_all_team_ids,
     admin_get_all_tool_ids,
     admin_get_gateway,
+    admin_refresh_gateway_tools,
     admin_get_grpc_methods,
     admin_get_grpc_service,
     admin_get_import_status,
@@ -3147,6 +3148,83 @@ class TestAdminGatewayRoutes:
         mock_get_gateway.side_effect = RuntimeError("boom")
         with pytest.raises(RuntimeError):
             await admin_get_gateway("gw-1", mock_db, user={"email": "test-user", "db": mock_db})
+
+    @pytest.mark.asyncio
+    async def test_admin_refresh_gateway_tools_success(self, monkeypatch, mock_db):
+        """Success path: returns GatewayRefreshResponse with correct counts."""
+        from datetime import datetime, timezone
+
+        import mcpgateway.admin as admin_mod
+
+        result_payload = {
+            "tools_added": 3,
+            "tools_updated": 1,
+            "tools_removed": 0,
+            "resources_added": 0,
+            "resources_updated": 0,
+            "resources_removed": 0,
+            "prompts_added": 0,
+            "prompts_updated": 0,
+            "prompts_removed": 0,
+            "validation_errors": [],
+            "duration_ms": 42.0,
+            "refreshed_at": datetime.now(timezone.utc),
+        }
+        monkeypatch.setattr(admin_mod.gateway_service, "get_gateway", AsyncMock(return_value=SimpleNamespace(id="gw-1")))
+        monkeypatch.setattr(admin_mod.gateway_service, "refresh_gateway_manually", AsyncMock(return_value=result_payload))
+
+        request = MagicMock(spec=Request)
+        request.headers = {"x-test": "1"}
+
+        response = await admin_refresh_gateway_tools(
+            "gw-1",
+            request,
+            include_resources=True,
+            include_prompts=False,
+            db=mock_db,
+            user={"email": "admin@example.com"},
+        )
+        assert response.gateway_id == "gw-1"
+        assert response.tools_added == 3
+        assert response.tools_updated == 1
+        admin_mod.gateway_service.refresh_gateway_manually.assert_awaited_once_with(
+            gateway_id="gw-1",
+            include_resources=True,
+            include_prompts=False,
+            user_email="admin@example.com",
+            request_headers=dict(request.headers),
+        )
+
+    @pytest.mark.asyncio
+    async def test_admin_refresh_gateway_tools_not_found(self, monkeypatch, mock_db):
+        """GatewayNotFoundError is translated to HTTP 404."""
+        import mcpgateway.admin as admin_mod
+        from mcpgateway.services.gateway_service import GatewayNotFoundError
+
+        monkeypatch.setattr(admin_mod.gateway_service, "get_gateway", AsyncMock(side_effect=GatewayNotFoundError("no such gateway")))
+
+        request = MagicMock(spec=Request)
+        request.headers = {}
+
+        with pytest.raises(HTTPException) as excinfo:
+            await admin_refresh_gateway_tools("missing", request, include_resources=False, include_prompts=False, db=mock_db, user={"email": "admin@example.com"})
+        assert excinfo.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_admin_refresh_gateway_tools_conflict(self, monkeypatch, mock_db):
+        """GatewayError (concurrent refresh) is translated to HTTP 409."""
+        import mcpgateway.admin as admin_mod
+        from mcpgateway.services.gateway_service import GatewayError
+
+        monkeypatch.setattr(admin_mod.gateway_service, "get_gateway", AsyncMock(return_value=SimpleNamespace(id="gw-1")))
+        monkeypatch.setattr(admin_mod.gateway_service, "refresh_gateway_manually", AsyncMock(side_effect=GatewayError("already refreshing")))
+
+        request = MagicMock(spec=Request)
+        request.headers = {}
+
+        with pytest.raises(HTTPException) as excinfo:
+            await admin_refresh_gateway_tools("gw-1", request, include_resources=False, include_prompts=False, db=mock_db, user={"email": "admin@example.com"})
+        assert excinfo.value.status_code == 409
 
     @patch.object(GatewayService, "register_gateway")
     async def test_admin_add_gateway_valid_auth_types(self, mock_register_gateway, mock_request, mock_db):

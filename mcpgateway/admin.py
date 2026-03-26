@@ -95,6 +95,7 @@ from mcpgateway.schemas import (
     CatalogServerStatusResponse,
     GatewayCreate,
     GatewayRead,
+    GatewayRefreshResponse,
     GatewayTestRequest,
     GatewayTestResponse,
     GatewayUpdate,
@@ -129,7 +130,7 @@ from mcpgateway.services.content_security import ContentSizeError
 from mcpgateway.services.email_auth_service import AuthenticationError, EmailAuthService, PasswordValidationError
 from mcpgateway.services.encryption_service import get_encryption_service
 from mcpgateway.services.export_service import ExportError, ExportService
-from mcpgateway.services.gateway_service import GatewayConnectionError, GatewayDuplicateConflictError, GatewayNameConflictError, GatewayNotFoundError, GatewayService
+from mcpgateway.services.gateway_service import GatewayConnectionError, GatewayDuplicateConflictError, GatewayError, GatewayNameConflictError, GatewayNotFoundError, GatewayService
 from mcpgateway.services.import_service import ConflictStrategy
 from mcpgateway.services.import_service import ImportError as ImportServiceError
 from mcpgateway.services.import_service import ImportService, ImportValidationError
@@ -1379,6 +1380,23 @@ def _resolve_root_path(request: Request) -> str:
     return root_path.rstrip("/")
 
 
+def _admin_cookie_path(request: Request) -> str:
+    """Return the cookie path scoped to the /admin subtree.
+
+    Args:
+        request: Incoming request used to resolve the root path.
+
+    Returns:
+        Cookie path string of the form ``{root}/admin``, e.g. ``/admin``
+        or ``/mounted/admin`` when deployed behind a path prefix.
+
+    Examples:
+        >>> _admin_cookie_path.__name__
+        '_admin_cookie_path'
+    """
+    return f"{_resolve_root_path(request)}/admin"
+
+
 def _normalize_origin_parts(scheme: str, netloc: str) -> tuple[str, str, int]:
     """Normalize origin components for exact same-origin comparisons.
 
@@ -1482,7 +1500,7 @@ def _set_admin_csrf_cookie(request: Request, response: Response) -> str:
 
     use_secure = (settings.environment == "production") or settings.secure_cookies
     max_age = max(300, int(getattr(settings, "token_expiry", 60)) * 60)
-    cookie_path = _resolve_root_path(request) or "/"
+    cookie_path = _admin_cookie_path(request)
     response.set_cookie(
         key=ADMIN_CSRF_COOKIE_NAME,
         value=csrf_token,
@@ -1505,7 +1523,7 @@ def _clear_admin_csrf_cookie(request: Request, response: Response) -> None:
     use_secure = (settings.environment == "production") or settings.secure_cookies
     response.delete_cookie(
         key=ADMIN_CSRF_COOKIE_NAME,
-        path=_resolve_root_path(request) or "/",
+        path=_admin_cookie_path(request),
         secure=use_secure,
         httponly=False,
         samesite="strict",
@@ -11775,6 +11793,59 @@ async def admin_get_gateway(gateway_id: str, db: Session = Depends(get_db), user
     except Exception as e:
         LOGGER.error(f"Error getting gateway {gateway_id}: {e}")
         raise e
+
+
+@admin_router.post("/gateways/{gateway_id}/tools/refresh", response_model=GatewayRefreshResponse)
+@require_permission("gateways.update", allow_admin_bypass=False)
+async def admin_refresh_gateway_tools(
+    gateway_id: str,
+    request: Request,
+    include_resources: bool = Query(False, description="Include resources in refresh"),
+    include_prompts: bool = Query(False, description="Include prompts in refresh"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> GatewayRefreshResponse:
+    """Trigger a manual refresh of tools/resources/prompts for a gateway via the admin UI.
+
+    CSRF protection is inherited from the admin_router dependency. This is the
+    admin-UI-facing counterpart to the REST API refresh endpoint.
+
+    Args:
+        gateway_id: ID of the gateway to refresh.
+        request: The FastAPI request object.
+        include_resources: Whether to include resources in the refresh.
+        include_prompts: Whether to include prompts in the refresh.
+        db: Database session dependency.
+        user: Authenticated user.
+
+    Returns:
+        GatewayRefreshResponse with counts of changes and any validation errors.
+
+    Raises:
+        HTTPException: 404 if gateway not found, 409 if refresh already in progress.
+
+    Examples:
+        >>> callable(admin_refresh_gateway_tools)
+        True
+        >>> admin_refresh_gateway_tools.__name__
+        'admin_refresh_gateway_tools'
+    """
+    user_email = get_user_email(user)
+    LOGGER.info(f"User '{SecurityValidator.sanitize_log_message(user_email)}' requested manual refresh for gateway {gateway_id}")
+    try:
+        await gateway_service.get_gateway(db, gateway_id)
+        result = await gateway_service.refresh_gateway_manually(
+            gateway_id=gateway_id,
+            include_resources=include_resources,
+            include_prompts=include_prompts,
+            user_email=user_email,
+            request_headers=dict(request.headers),
+        )
+        return GatewayRefreshResponse(gateway_id=gateway_id, **result)
+    except GatewayNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except GatewayError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @admin_router.post("/gateways")
