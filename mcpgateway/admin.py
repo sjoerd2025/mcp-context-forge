@@ -4121,7 +4121,7 @@ async def admin_login_page(request: Request) -> Response:
     # Check if email auth is enabled
     if not getattr(settings, "email_auth_enabled", False):
         root_path = _resolve_root_path(request)
-        return RedirectResponse(url=f"{root_path}/admin", status_code=303)
+        return RedirectResponse(url=f"{root_path}/admin/", status_code=303)
 
     root_path = settings.app_root_path
 
@@ -4139,7 +4139,7 @@ async def admin_login_page(request: Request) -> Response:
                     # creating an infinite redirect loop.
                     is_admin = payload.get("is_admin", False) or payload.get("user", {}).get("is_admin", False)
                     if is_admin:
-                        return RedirectResponse(url=f"{root_path}/admin", status_code=303)
+                        return RedirectResponse(url=f"{root_path}/admin/", status_code=303)
             except (HTTPException, jwt.PyJWTError):
                 # Token is invalid or expired, continue to show login page
                 pass
@@ -4211,7 +4211,7 @@ async def admin_login_handler(request: Request, db: Session = Depends(get_db)) -
     """
     if not getattr(settings, "email_auth_enabled", False):
         root_path = _resolve_root_path(request)
-        return RedirectResponse(url=f"{root_path}/admin", status_code=303)
+        return RedirectResponse(url=f"{root_path}/admin/", status_code=303)
 
     try:
         form = await request.form()
@@ -4311,7 +4311,7 @@ async def admin_login_handler(request: Request, db: Session = Depends(get_db)) -
 
             # Create redirect response
             root_path = _resolve_root_path(request)
-            response = RedirectResponse(url=f"{root_path}/admin", status_code=303)
+            response = RedirectResponse(url=f"{root_path}/admin/", status_code=303)
 
             # Set JWT token as secure cookie
             try:
@@ -4752,7 +4752,7 @@ async def change_password_required_page(request: Request) -> HTMLResponse:
     """
     if not getattr(settings, "email_auth_enabled", False):
         root_path = _resolve_root_path(request)
-        return RedirectResponse(url=f"{root_path}/admin", status_code=303)
+        return RedirectResponse(url=f"{root_path}/admin/", status_code=303)
 
     # Get root path for template
     root_path = _resolve_root_path(request)
@@ -4821,7 +4821,7 @@ async def change_password_required_handler(request: Request, db: Session = Depen
     """
     if not getattr(settings, "email_auth_enabled", False):
         root_path = _resolve_root_path(request)
-        return RedirectResponse(url=f"{root_path}/admin", status_code=303)
+        return RedirectResponse(url=f"{root_path}/admin/", status_code=303)
 
     try:
         form = await request.form()
@@ -4896,7 +4896,7 @@ async def change_password_required_handler(request: Request, db: Session = Depen
 
                 # Create redirect response to admin panel
                 root_path = _resolve_root_path(request)
-                response = RedirectResponse(url=f"{root_path}/admin", status_code=303)
+                response = RedirectResponse(url=f"{root_path}/admin/", status_code=303)
 
                 # Update JWT token cookie
                 try:
@@ -15498,7 +15498,7 @@ async def admin_set_a2a_agent_state(
     """
     if not a2a_service or not settings.mcpgateway_a2a_enabled:
         root_path = _resolve_root_path(request)
-        return RedirectResponse(f"{root_path}/admin#a2a-agents", status_code=303)
+        return RedirectResponse(f"{root_path}/admin/#a2a-agents", status_code=303)
 
     user_email = get_user_email(user)
     error_message = None
@@ -15552,7 +15552,7 @@ async def admin_delete_a2a_agent(
     """
     if not a2a_service or not settings.mcpgateway_a2a_enabled:
         root_path = _resolve_root_path(request)
-        return RedirectResponse(f"{root_path}/admin#a2a-agents", status_code=303)
+        return RedirectResponse(f"{root_path}/admin/#a2a-agents", status_code=303)
 
     error_message = None
     is_inactive_checked = "false"
