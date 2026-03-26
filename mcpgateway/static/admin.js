@@ -13928,8 +13928,11 @@ async function runToolValidation(testIndex) {
         const payload = {
             jsonrpc: "2.0",
             id: Date.now(),
-            method: AppState.currentTestTool.name,
-            params,
+            method: "tools/call",
+            params: {
+                name: AppState.currentTestTool.name,
+                arguments: params,
+            },
         };
 
         // Parse custom headers from the passthrough headers field
@@ -14396,8 +14399,11 @@ async function runToolTest() {
         const payload = {
             jsonrpc: "2.0",
             id: Date.now(),
-            method: AppState.currentTestTool.name,
-            params,
+            method: "tools/call",
+            params: {
+                name: AppState.currentTestTool.name,
+                arguments: params,
+            },
         };
 
         // Parse custom headers from the passthrough headers field
