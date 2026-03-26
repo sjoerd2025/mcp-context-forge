@@ -114,14 +114,18 @@ def _make_plugin_config(
     config: dict[str, Any] = {
         "algorithm": algorithm,
         "backend": backend,
-        "by_user": user_rate,
         "redis_url": redis_url,
         "redis_key_prefix": redis_key_prefix,
         "redis_fallback": False,
     }
-    if dimensions >= 3:
-        config["by_tenant"] = "6000000/m" if workload != "mixed" else "6/m"
-        config["by_tool"] = {"benchmark_tool": "3000000/m" if workload != "mixed" else "5/m"}
+    if dimensions == 0:
+        # Baseline: no rate limits configured — plugin short-circuits immediately.
+        pass
+    else:
+        config["by_user"] = user_rate
+        if dimensions >= 3:
+            config["by_tenant"] = "6000000/m" if workload != "mixed" else "6/m"
+            config["by_tool"] = {"benchmark_tool": "3000000/m" if workload != "mixed" else "5/m"}
     return PluginConfig(
         name=f"rate-limiter-bench-{algorithm}-{backend}-d{dimensions}-{workload}",
         kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
@@ -438,6 +442,20 @@ async def _benchmark_throughput(
 
 async def _run_latency(args: argparse.Namespace, redis_enabled: bool) -> None:
     """Run latency-mode benchmarks."""
+    # --- Baseline: no rate limits configured ---
+    if args.baseline:
+        hook = args.hooks[0]
+        baseline_scenario = Scenario(algorithm="fixed_window", backend="memory", hook=hook, dimensions=0, workload="allow")
+        print("=" * 88)
+        print(f"BASELINE (no rate limits) / {hook}")
+        print("=" * 88)
+        baseline_result = await _benchmark_scenario(baseline_scenario, "Python", args.iterations, args.warmup, args.redis_url)
+        print(f"  Baseline: mean {baseline_result.mean_ms:.4f} ms | median {baseline_result.median_ms:.4f} ms | p95 {baseline_result.p95_ms:.4f} ms")
+        print()
+    else:
+        baseline_result = None
+
+    # --- Per-scenario benchmarks ---
     scenarios = [
         Scenario(algorithm=algorithm, backend=backend, hook=hook, dimensions=args.dimensions, workload=args.workload)
         for algorithm in ("fixed_window", "sliding_window", "token_bucket")
@@ -459,9 +477,13 @@ async def _run_latency(args: argparse.Namespace, redis_enabled: bool) -> None:
         python_result = await _benchmark_scenario(scenario, "Python", args.iterations, args.warmup, args.redis_url)
         rust_result = await _benchmark_scenario(scenario, "Rust", args.iterations, args.warmup, args.redis_url)
         speedup = python_result.mean_ms / rust_result.mean_ms if rust_result.mean_ms else 0.0
-        print(f"  Python: mean {python_result.mean_ms:.3f} ms | median {python_result.median_ms:.3f} ms | p95 {python_result.p95_ms:.3f} ms")
-        print(f"  Rust:   mean {rust_result.mean_ms:.3f} ms | median {rust_result.median_ms:.3f} ms | p95 {rust_result.p95_ms:.3f} ms")
+        print(f"  Python:  mean {python_result.mean_ms:.3f} ms | median {python_result.median_ms:.3f} ms | p95 {python_result.p95_ms:.3f} ms")
+        print(f"  Rust:    mean {rust_result.mean_ms:.3f} ms | median {rust_result.median_ms:.3f} ms | p95 {rust_result.p95_ms:.3f} ms")
         print(f"  Speedup: {speedup:.2f}x faster")
+        if baseline_result and baseline_result.mean_ms > 0:
+            py_overhead = python_result.mean_ms - baseline_result.mean_ms
+            rs_overhead = rust_result.mean_ms - baseline_result.mean_ms
+            print(f"  Rate-limiter overhead: Python +{py_overhead:.3f} ms | Rust +{rs_overhead:.3f} ms")
         print()
 
 
@@ -592,6 +614,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Thread count for throughput mode (default: sweep 1,2,4,8)",
+    )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        default=False,
+        help="Include a baseline run (no rate limits) to measure plugin overhead",
     )
     return parser.parse_args()
 

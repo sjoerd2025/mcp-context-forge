@@ -773,30 +773,22 @@ async def test_concurrent_requests_respect_limit():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Gap: fixed window allows 2× the limit at a window boundary. "
-        "N requests at end of W1 + N requests at start of W2 all succeed."
-    ),
-)
 @pytest.mark.asyncio
-async def test_fixed_window_burst_at_boundary():
-    """
-    A user can burst at a window boundary: N requests at the end of window W1
-    and N requests at the start of W2 both succeed, giving 2× the limit in practice.
+async def test_fixed_window_allows_boundary_burst():
+    """Empirical proof: fixed_window allows 2× the limit at a window boundary.
+
+    A user sends N requests at the end of window W1 and N more at the start of
+    W2.  All 2N succeed because the counter resets at the boundary.
 
     Example with limit=5/s:
       t=1000: requests 1-5 → allowed (window W1, count=5)
       t=1001: requests 6-10 → allowed (window W2 resets, count=1..5)
       Total = 10 requests in ~1 second against a limit of 5/s.
 
-    Fix: use a sliding window or token bucket algorithm.
+    This is the expected behavior of the fixed_window algorithm — not a bug,
+    but a documented trade-off.  Use sliding_window or token_bucket to prevent
+    boundary bursts (see companion test below).
     """
-    # Force the Python path: this test documents a known Python backend limitation
-    # (fixed window allows 2× the limit at a window boundary via time mocking).
-    # The Rust engine uses monotonic time for window tracking independently of
-    # the Python time mock, so the burst scenario does not reproduce there.
     import plugins.rate_limiter.rate_limiter as _rl_mod
 
     with patch.object(_rl_mod, "_RUST_AVAILABLE", False):
@@ -821,12 +813,55 @@ async def test_fixed_window_burst_at_boundary():
             if r.violation is None:
                 allowed_total += 1
 
-    # Expected: a sliding window would cap total at ~5-6 across the boundary
-    # Actual:   fixed window allows all 10 (5 in W1 + 5 in W2)
-    assert allowed_total <= 5, (
-        f"Fixed window burst: {allowed_total} requests allowed across the window "
-        f"boundary. Configured limit is 5/s. "
-        f"Fix: replace fixed window with a sliding window or token bucket."
+    # fixed_window: all 10 allowed (5 in W1 + 5 in W2 = 2× limit in ~1 second)
+    assert allowed_total == 10, (
+        f"Expected fixed_window to allow 2× the limit at boundary, got {allowed_total}/10"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sliding_window_prevents_boundary_burst():
+    """Companion proof: sliding_window prevents the boundary burst that fixed_window allows.
+
+    Same scenario as test_fixed_window_allows_boundary_burst but with
+    sliding_window.  The 5 requests from W1 are still within the sliding window
+    when W2 starts, so the second batch is blocked.
+    """
+    import plugins.rate_limiter.rate_limiter as _rl_mod
+
+    with patch.object(_rl_mod, "_RUST_AVAILABLE", False):
+        plugin = RateLimiterPlugin(
+            PluginConfig(
+                name="rl-sw",
+                kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+                hooks=[ToolHookType.TOOL_PRE_INVOKE],
+                config={"by_user": "5/s", "algorithm": ALGORITHM_SLIDING_WINDOW},
+            )
+        )
+    ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+    payload = ToolPreInvokePayload(name="test_tool", arguments={})
+
+    allowed_total = 0
+
+    with patch("plugins.rate_limiter.rate_limiter.time") as mock_time:
+        # Window W1: fill the limit exactly at t=1000
+        mock_time.time.return_value = 1000.0
+        for _ in range(5):
+            r = await plugin.tool_pre_invoke(payload, ctx)
+            if r.violation is None:
+                allowed_total += 1
+
+        # Half a second later: W1 timestamps are still within the 1s sliding window
+        mock_time.time.return_value = 1000.5
+        for _ in range(5):
+            r = await plugin.tool_pre_invoke(payload, ctx)
+            if r.violation is None:
+                allowed_total += 1
+
+    # sliding_window: only 5 allowed — the W1 timestamps at t=1000 are still
+    # within the window at t=1000.5, so the second batch is blocked.
+    assert allowed_total == 5, (
+        f"Expected sliding_window to prevent boundary burst, got {allowed_total}/10 allowed"
     )
 
 
